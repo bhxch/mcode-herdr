@@ -32,7 +32,13 @@ find "$DEST" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null ||
 chmod +x "$DEST/scripts"/*.py
 
 echo "==> 验证插件已被本地市场识别"
-mcode plugin list -m local --available | grep -E '^.\*\].*mcode-herdr@local' \
+# 校验必须针对上面实际写入的 $DEST。cron / wrapper / CI 中调用者的 MAVIS_DATA_DIR
+# 可能未导出，此时 mcode 列的是默认 profile，校验要么空过、要么报一个与本次写入
+# 无关的失败，都不描述装到哪儿了。这里只为这一条命令设置 MINIMAX_DATA_DIR（不动
+# 脚本自身环境），因为它是 mcode 解析链的最高优先级（MINIMAX_DATA_DIR →
+# MAVIS_DATA_DIR → 默认值，见 data-dir.ts 的 readDataDirOverride），非空即屏蔽
+# 其余两层，mcode 必定解析到 $DATA_DIR。
+MINIMAX_DATA_DIR="$DATA_DIR" mcode plugin list -m local --available | grep -E '^.\*\].*mcode-herdr@local' \
   || { echo "未识别！请检查 plugin.json 是否有 icon 字段（必填，缺失会被静默跳过）" >&2; exit 1; }
 
 echo "==> 检查恢复命令的 mcode 是否可被 herdr 执行"

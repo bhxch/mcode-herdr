@@ -26,6 +26,17 @@ class Action:
 
 @dataclass(frozen=True)
 class Decision:
+    """状态机交给运行时的唯一契约。
+
+    - kind 决定消费方式：REPORT 按 state 改 pane 状态，RELEASE 交还 pane。
+    - state 只对 REPORT 有意义，RELEASE 时为空串。
+    - attach_session / resume 只由 session-start 的「认领」路径置位：那是 pane
+      第一次学到本次会话的 id，也只有那一刻能拿到恢复命令去 attach。
+    - new_root_session 非空时，用它覆盖 store 里已存的 root_session。
+    - 不变式：state != "blocked" 的 REPORT 一定带 blocked_by=None，消费方因此
+      可以无条件信任 decision.blocked_by。
+    """
+
     class Kind(Enum):
         REPORT = "report"
         RELEASE = "release"

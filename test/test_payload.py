@@ -34,6 +34,36 @@ class PayloadTest(unittest.TestCase):
         p = fixture("post_tool_root.json")
         self.assertIsNone(p.agent_id)
 
+    def test_ask_user_post_tool_reports_waiting_for_user(self):
+        """实测样本：ask_user 带 terminate + waiting_for_user 立刻返回，问卷还开着。"""
+        p = fixture("post_tool_ask_user_waiting.json")
+        self.assertEqual(p.tool_name, "ask_user")
+        self.assertTrue(p.waiting_for_user)
+
+    def test_post_tool_without_details_is_not_waiting(self):
+        # post_tool_root.json 的 tool_response 里没有 details，等价于没有等待证据
+        self.assertFalse(fixture("post_tool_root.json").waiting_for_user)
+
+    def test_waiting_for_user_defaults_false_without_tool_response(self):
+        p = load_payload('{"hook_event_name":"PostToolUse","tool_name":"ask_user"}')
+        self.assertFalse(p.waiting_for_user)
+
+    def test_waiting_for_user_tolerates_null_details(self):
+        # details 为 null / 非对象都必须退化成 False，绝不能抛 —— 钩子抛异常等于整个插件静默
+        for details in ("null", "[]", '"ask_1"'):
+            with self.subTest(details=details):
+                p = load_payload('{"hook_event_name":"PostToolUse","tool_name":"ask_user",'
+                                 f'"tool_response":{{"details":{details},"terminate":true}}}}')
+                self.assertFalse(p.waiting_for_user)
+
+    def test_non_boolean_waiting_for_user_is_not_truthy(self):
+        # 只认真布尔值：字符串 "true" 不算在等，否则任何脏载荷都能把 pane 永久钉在 blocked
+        for value in ('"true"', "1", "null"):
+            with self.subTest(value=value):
+                p = load_payload('{"hook_event_name":"PostToolUse","tool_name":"ask_user",'
+                                 f'"tool_response":{{"details":{{"waiting_for_user":{value}}}}}}}')
+                self.assertFalse(p.waiting_for_user)
+
     def test_stop_fields(self):
         p = fixture("stop.json")
         self.assertEqual(p.event, "Stop")

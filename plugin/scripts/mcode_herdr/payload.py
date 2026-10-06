@@ -3,6 +3,11 @@
 字段名来自实测（见设计文档 §2.6/§2.8），解析保持宽容：
 缺失、空字符串、纯空白字符串一律归一为 None，非空字符串去掉首尾空白，
 避免下游到处判空，也避免带空白的 id 被原样拼进 mcode 恢复命令。
+
+布尔标记同理只认真布尔值：waiting_for_user 取自
+tool_response.details.waiting_for_user，是 ask_user 问卷是否仍在等人回答的权威信号
+（实测 ask_user 立刻带 terminate=true + waiting_for_user=true 返回，问卷还开着），
+缺失、null 或任何非布尔取值一律归一为 False，绝不抛。
 """
 from __future__ import annotations
 
@@ -21,12 +26,30 @@ class Payload:
     source: Optional[str]
     cwd: Optional[str]
     stop_hook_active: bool
+    waiting_for_user: bool = False
 
 
 def _text(value: Any) -> Optional[str]:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
+
+
+def _waiting_for_user(data: dict) -> bool:
+    """取 tool_response.details.waiting_for_user，逐层缺失/null 都退化成 False。
+
+    逐层 isinstance 是为了容忍线上真实存在的几种形态：老版本 ask_user 根本不回
+    tool_response、tool_response 里没有 details、details 为 null。任何一层不合预期
+    都只意味着「没证据说还在等」，此时按 False 走原有的清障路径，不会静默卡死在 blocked。
+    """
+    response = data.get("tool_response")
+    if not isinstance(response, dict):
+        return False
+    details = response.get("details")
+    if not isinstance(details, dict):
+        return False
+    value = details.get("waiting_for_user")
+    return value if isinstance(value, bool) else False
 
 
 def load_payload(raw: str) -> Payload:
@@ -48,4 +71,5 @@ def load_payload(raw: str) -> Payload:
         source=_text(data.get("source")),
         cwd=_text(data.get("cwd")),
         stop_hook_active=bool(data.get("stop_hook_active")),
+        waiting_for_user=_waiting_for_user(data),
     )

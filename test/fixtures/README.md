@@ -11,7 +11,8 @@
 | `session_start.json` | 早期探索时真实抓到的 `SessionStart` 事件 | 实测，仅替换了 `cwd` 等本地路径类取值 |
 | `pre_tool_root.json` | 早期探索时真实抓到的 `PreToolUse` 事件（根会话） | 实测，仅替换了 `transcript_path` |
 | `stop.json` | 早期探索时真实抓到的 `Stop` 事件 | 实测，`last_assistant_message` 的内容为可读性改写 |
-| `pre_tool_subagent.json` | 依据 mcode `plugin-hooks/src/runner.ts` 的 `subagentFields` 字段契约构造 | 构造，从未实时抓到子代理工具事件 |
+| `post_tool_ask_user_waiting.json` | mcode 0.6.3 真机会话里实时抓到的 `ask_user` `PostToolUse` 事件 | 实测，仅 `tool_input.steps` 的问题正文与部分标识符被改写（见下） |
+| `pre_tool_subagent.json` | 依据 mcode `plugin-hooks/src/runner.ts` 的 `subagentFields` 字段契约构造 | 构造，子代理工具事件的字段形状来自源码而非抓包 |
 | `post_tool_root.json` | 仿照真实 `PostToolUse` 事件构造，用于验证空值归一 | 构造，`"agent_id": ""` 是防御性取值，非线上格式 |
 
 ## 构造细节与注意事项
@@ -31,3 +32,12 @@
   对应的测试是 `test_empty_agent_id_is_treated_as_absent`。
 - **`stop.json` 的 `last_assistant_message` 内容已改写。** 保留该字段的意义只在于
   其存在性与布尔类型，文本本身无断言价值。
+- **`post_tool_ask_user_waiting.json` 是这次抓包的关键证据。** 它记录的是真实时序：
+  `ask_user` 工具调用在 `PreToolUse` 之后约 33ms 就带着 `terminate: true` 和
+  `details.waiting_for_user: true` 返回，`Stop` 又在约 56ms 后到来 —— 也就是说
+  **turn 已经结束，问卷却还开着**。摘录时只改写了 `tool_input.steps` 里的问题正文、
+  以及 `tool_use_id` / `session_id` / `turn_id` 这几个无语义的标识符；
+  `tool_response.content` 文本、`details` 全字段（含 `waiting_for_user`）和 `terminate`
+  均为线上原值，对应测试是 `test_ask_user_post_tool_reports_waiting_for_user`。
+  恢复 `blocked` 的真实信号不是这个 `PostToolUse`，而是用户作答时以新 turn
+  重新发出的 `UserPromptSubmit`。

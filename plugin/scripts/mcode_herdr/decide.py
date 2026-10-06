@@ -2,8 +2,14 @@
 
 设计要点：
 - 子代理有独立 session_id，因此「session_id != root_session」就是可靠判据。
-- 但 blocked 是例外：子代理调 ask_user 时人确实被卡住了，必须上报，
-  并记下 blocked_by，让只有提问者自己的 PostToolUse 能清掉它。
+- blocked 是例外：子代理调 ask_user 时人确实被卡住了，必须上报，并记下 blocked_by，
+  让只有提问者自己的 PostToolUse 能清掉它。
+- 但「清掉它」的前提是问卷真的被答了。实测 ask_user 立刻就带着
+  tool_response.terminate=true / details.waiting_for_user=true 返回（PreToolUse 后
+  约 33ms），随后约 56ms 就来 Stop —— **turn 结束的时候问卷还开着**。
+  所以 ask_user 的 PostToolUse 只在 waiting_for_user 为假时才允许清障；
+  Stop 同样不代表问题已解决：只要 pane 还记着 blocked_by，就不许翻 idle。
+  真正的解障信号是用户作答时重新发出的 UserPromptSubmit（user-prompt 分支）。
 - SessionStart 在 pane 处于 working 时到达 → 必定是子代理创建，忽略。
 - 与上次相同的状态不上报，减少噪声（herdr 侧通知本身也按跃迁去重）。
 """
@@ -90,11 +96,22 @@ def decide(action: Action, payload: Payload, state: PaneState) -> Optional[Decis
             return None
         if not state.blocked_by or payload.session_id != state.blocked_by:
             return None
+        if payload.waiting_for_user:
+            # 问卷还开着，人还在等：这个 PostToolUse 只是 ask_user 提前收工，
+            # 不是作答。原实现在这里翻 working，实测只让 blocked 存在了 121ms，
+            # 紧接着 Stop 又把 pane 标成 done —— herdr agent wait --until blocked
+            # 因此基本永远等不到。保持不动，一个字节都不上报。
+            return None
         return _report("working", state, clear_blocked=True)
 
     if name == "stop":
         if not root or payload.session_id != root:
             return None  # 子代理的 Stop 绝不能把 pane 翻成 idle
+        if state.blocked_by:
+            # turn 结束 ≠ 问题解决：ask_user 是带 terminate 提前收工的，
+            # 此刻人还杵在问卷前面。翻 idle 等于对外宣称「任务完成」。
+            # 解障交给 user-prompt：作答会重新触发 UserPromptSubmit。
+            return None
         return _report("idle", state, clear_blocked=True)
 
     if name == "session-end":

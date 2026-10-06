@@ -8,10 +8,12 @@ ROOT = "sess-root"
 CHILD = "sess-child"
 
 
-def p(event, session_id=ROOT, tool_name=None, agent_id=None, source=None):
+def p(event, session_id=ROOT, tool_name=None, agent_id=None, source=None,
+      waiting_for_user=False):
     return Payload(event=event, session_id=session_id, tool_name=tool_name,
                    agent_id=agent_id, agent_type=None, source=source,
-                   cwd="/tmp", stop_hook_active=False)
+                   cwd="/tmp", stop_hook_active=False,
+                   waiting_for_user=waiting_for_user)
 
 
 class DecideTest(unittest.TestCase):
@@ -74,10 +76,32 @@ class DecideTest(unittest.TestCase):
         self.assertIsNone(decide(Action("pre-tool"), p("PreToolUse", tool_name="bash"), PaneState(root_session=ROOT)))
 
     def test_posttool_clears_only_own_blocked(self):
+        # waiting_for_user=False 才代表问卷确实被答掉了（作答会让 ask_user 带着
+        # 已完成的 tool_response 真正返回，或直接以 UserPromptSubmit 续上新 turn）
         st = PaneState(root_session=ROOT, blocked_by=ROOT, last_reported="blocked")
         d = decide(Action("post-tool"), p("PostToolUse", tool_name="ask_user"), st)
         self.assertEqual(d.state, "working")
         self.assertIsNone(d.blocked_by)
+
+    def test_posttool_while_questionnaire_open_keeps_blocked(self):
+        """P0 回归：ask_user 带 waiting_for_user 立刻返回时，问卷还开着，绝不清障。
+
+        实测时序 PostToolUse(+33ms) → Stop(+56ms)，turn 在人作答前就结束了。
+        原实现在这里翻 working，blocked 只存在 121ms 就被抹掉。
+        last_reported 取 "blocked"：无守卫版本会报 "working"，不会被去重吞掉。
+        """
+        st = PaneState(root_session=ROOT, blocked_by=ROOT, last_reported="blocked")
+        d = decide(Action("post-tool"),
+                   p("PostToolUse", tool_name="ask_user", waiting_for_user=True), st)
+        self.assertIsNone(d)
+
+    def test_posttool_while_questionnaire_open_from_child_also_keeps_blocked(self):
+        # 子代理提问同一条路：blocked_by 记的是子会话，守卫与等待态都要生效
+        st = PaneState(root_session=ROOT, blocked_by=CHILD, last_reported="blocked")
+        d = decide(Action("post-tool"),
+                   p("PostToolUse", session_id=CHILD, tool_name="ask_user",
+                     agent_id=CHILD, waiting_for_user=True), st)
+        self.assertIsNone(d)
 
     def test_posttool_from_other_session_cannot_clear_root_blocked(self):
         st = PaneState(root_session=ROOT, blocked_by=ROOT, last_reported="blocked")
@@ -93,11 +117,35 @@ class DecideTest(unittest.TestCase):
         st2 = PaneState(root_session=ROOT, last_reported="idle")
         self.assertIsNone(decide(Action("post-tool"), p("PostToolUse", tool_name="ask_user", session_id=None), st2))
 
-    def test_stop_root_reports_idle_and_clears_blocked(self):
+    def test_stop_while_blocked_does_not_flip_to_idle(self):
+        """P0 回归：turn 结束不等于问题解决。
+
+        实测 ask_user 是带 terminate 提前收工的，Stop 到达时问卷还开着，
+        翻 idle 会让 pane 对外宣称「任务完成」，orchestrator 直接误判收工。
+        last_reported 取 "blocked"：无守卫版本会报 "idle"，不会被去重吞掉。
+        """
         st = PaneState(root_session=ROOT, blocked_by=CHILD, last_reported="blocked")
+        self.assertIsNone(decide(Action("stop"), p("Stop"), st))
+
+    def test_stop_root_reports_idle_when_not_blocked(self):
+        st = PaneState(root_session=ROOT, last_reported="working")
         d = decide(Action("stop"), p("Stop"), st)
         self.assertEqual(d.state, "idle")
         self.assertIsNone(d.blocked_by)
+
+    def test_stop_is_deduped_when_already_idle(self):
+        st = PaneState(root_session=ROOT, last_reported="idle")
+        self.assertIsNone(decide(Action("stop"), p("Stop"), st))
+
+    def test_blocked_recovers_to_working_via_user_prompt(self):
+        """blocked 不会卡死：作答就是一次新的 UserPromptSubmit，必然回到 working。"""
+        st = PaneState(root_session=ROOT, blocked_by=ROOT, last_reported="blocked")
+        d = decide(Action("user-prompt"), p("UserPromptSubmit"), st)
+        self.assertEqual(d.state, "working")
+        self.assertIsNone(d.blocked_by)
+        follow = decide(Action("stop"), p("Stop"),
+                        PaneState(root_session=ROOT, last_reported="working"))
+        self.assertEqual(follow.state, "idle")
 
     def test_stop_from_child_never_flips_to_idle(self):
         st = PaneState(root_session=ROOT, last_reported="working")

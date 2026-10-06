@@ -1,0 +1,1 @@
+{"agent_id":"mvs_child_123","agent_type":"explore","tool_name":"ask_user","tool_input":{"questions":[]},"tool_use_id":"call_function_child_1","hook_event_name":"PreToolUse","session_id":"mvs_child_123","turn_id":"turn_child","transcript_path":"/tmp/y.compatible.jsonl"}

@@ -1,0 +1,1 @@
+{"tool_name":"bash","tool_input":{"command":"echo herdr-probe-ok","description":"Print probe string"},"tool_use_id":"call_function_bgtgms728wl3_1","hook_event_name":"PreToolUse","session_id":"mvs_c65b1e8d72184dc6b81ba6284bd37594","turn_id":"turn_muw8nbkb_0zs0vj","transcript_path":"/tmp/x.compatible.jsonl"}

@@ -65,9 +65,10 @@ def _socket_report(env: Mapping[str, str], method: str, params: dict) -> bool:
         reply = json.loads(buf.decode("utf-8", "replace"))
         # 只有 {"id":..., "result":...} 形状的 herdr 应答才算“已接收”：
         # 数组/null/裸数字/乱码都不是应答（null 还会让 in 判断抛 TypeError 逃出去），
+        # 光秃秃的 {} / {"id":...} 同理不是应答，只说明对端会吐 JSON 而没说它收下了这次上报，
         # 把它们误判成成功，调用方就会记下一个 herdr 根本不知道的状态，
         # 而 decide() 按 last_reported 去重会把同一事件永久压掉，pane 再无恢复触发地发散
-        return isinstance(reply, dict) and "error" not in reply
+        return isinstance(reply, dict) and "result" in reply and "error" not in reply
     except (OSError, ValueError, json.JSONDecodeError):
         # socket.timeout 即 TimeoutError，是 OSError 子类，0.5s 超时已在此被吞掉
         return False

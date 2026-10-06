@@ -15,6 +15,9 @@ from . import herdr
 
 _COMMAND_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 
+# 单次 recv 的量级：herdr 的 ok/err 应答只有几十字节，超出这个量级还没换行就不是正常应答
+_MAX_REPLY_BYTES = 4096
+
 
 def _run_cli(argv: Sequence[str], timeout: float) -> int:
     """独立成函数，便于测试替换。"""
@@ -55,14 +58,21 @@ def _socket_report(env: Mapping[str, str], method: str, params: dict) -> bool:
         conn.connect(sock_path)
         conn.sendall(json.dumps(payload).encode() + b"\n")
         buf = b""
+        # SOCKET_TIMEOUT 只约束单次 socket 操作，滴字节的对端能把整个读取拖到任意长；
+        # 这里在 mcode 的 hook 关键路径上（只有 5s），herdr 不能反过来拖住 mcode，
+        # 所以除了逐次超时还要给整段读取一个总时限和缓冲上限
+        deadline = time.monotonic() + herdr.SOCKET_TIMEOUT
         while not buf.endswith(b"\n"):
+            if time.monotonic() >= deadline or len(buf) >= _MAX_REPLY_BYTES:
+                return False
             chunk = conn.recv(4096)
             if not chunk:
                 break
             buf += chunk
         if not buf:
             return False
-        reply = json.loads(buf.decode("utf-8", "replace"))
+        # 只取第一行：一条连接上若还跟着别的应答，json.loads 整个 buffer 会报 "Extra data"
+        reply = json.loads(buf.split(b"\n", 1)[0].decode("utf-8", "replace"))
         # 只有 {"id":..., "result":...} 形状的 herdr 应答才算“已接收”：
         # 数组/null/裸数字/乱码都不是应答（null 还会让 in 判断抛 TypeError 逃出去），
         # 光秃秃的 {} / {"id":...} 同理不是应答，只说明对端会吐 JSON 而没说它收下了这次上报，
@@ -135,5 +145,10 @@ def release(env: Mapping[str, str], seq: int) -> bool:
 
 
 def next_seq() -> int:
-    """herdr 要求 seq 严格递增；time_ns 跨进程也单调。"""
-    return time.time_ns()
+    """herdr 要求 seq 严格递增；monotonic_ns 在 Linux 上是系统级时钟，跨进程也单调。"""
+    # 必须用单调时钟而不是墙上时钟：time_ns 取的是 CLOCK_REALTIME，NTP 回步或校时会让它倒退。
+    # seq 一旦没有变大，herdr 会静默丢弃这次上报却照样回 ok —— 调用方无从察觉，仍然记下
+    # last_reported，之后 decide() 按它把同一事件全部去重，于是 pane 再无恢复触发地发散。
+    # 本插件只跑在 Linux 上，CLOCK_MONOTONIC 是系统级的：跨进程一致且永不倒退；
+    # 它在重启后归零，但那时 herdr 自己的状态也跟着机器一起没了，无害
+    return time.monotonic_ns()

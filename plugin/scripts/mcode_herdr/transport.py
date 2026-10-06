@@ -47,9 +47,12 @@ def _socket_report(env: Mapping[str, str], method: str, params: dict) -> bool:
     if not sock_path:
         return False
     payload = {"id": f"{herdr.SOURCE}:{time.time_ns()}", "method": method, "params": params}
-    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    conn.settimeout(herdr.SOCKET_TIMEOUT)
+    conn = None
     try:
+        # socket() 自己也会抛（fd 耗尽 EMFILE），所以构造和超时设置都得在守卫区内，
+        # 否则异常会逃出 report()，而且 finally 里的 close 也没机会执行
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn.settimeout(herdr.SOCKET_TIMEOUT)
         conn.connect(sock_path)
         conn.sendall(json.dumps(payload).encode() + b"\n")
         buf = b""
@@ -60,11 +63,18 @@ def _socket_report(env: Mapping[str, str], method: str, params: dict) -> bool:
             buf += chunk
         if not buf:
             return False
-        return "error" not in json.loads(buf.decode("utf-8", "replace"))
+        reply = json.loads(buf.decode("utf-8", "replace"))
+        # 只有 {"id":..., "result":...} 形状的 herdr 应答才算“已接收”：
+        # 数组/null/裸数字/乱码都不是应答（null 还会让 in 判断抛 TypeError 逃出去），
+        # 把它们误判成成功，调用方就会记下一个 herdr 根本不知道的状态，
+        # 而 decide() 按 last_reported 去重会把同一事件永久压掉，pane 再无恢复触发地发散
+        return isinstance(reply, dict) and "error" not in reply
     except (OSError, ValueError, json.JSONDecodeError):
+        # socket.timeout 即 TimeoutError，是 OSError 子类，0.5s 超时已在此被吞掉
         return False
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 def report(env: Mapping[str, str], state: str, seq: int, *,

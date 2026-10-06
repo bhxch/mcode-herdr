@@ -15,11 +15,15 @@ ENV = {
 }
 
 
-class FakeSocketServer:
-    """最小 herdr server：接受一行 JSON，回一行 ok。"""
+OK_REPLY = json.dumps({"id": "r1", "result": {"type": "ok"}}).encode() + b"\n"
 
-    def __init__(self, path):
+
+class FakeSocketServer:
+    """最小 herdr server：接受一行 JSON，回一行 reply（默认 ok 应答）。"""
+
+    def __init__(self, path, reply=OK_REPLY):
         self.path = Path(path)
+        self.reply = reply
         self.requests = []
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._sock.bind(str(self.path))
@@ -40,7 +44,7 @@ class FakeSocketServer:
                 if not line:
                     continue
                 self.requests.append(json.loads(line))
-                data.write(json.dumps({"id": "r1", "result": {"type": "ok"}}).encode() + b"\n")
+                data.write(self.reply)
                 data.flush()
 
     def close(self):
@@ -64,6 +68,13 @@ class TransportTest(unittest.TestCase):
     def _fake_cli(self, argv, timeout):
         self.calls.append(argv)
         return 0
+
+    def _fake_cli_code(self, code):
+        """让回落 CLI 返回固定码：这样 report() 的聚合结果能反推 socket 通道的判定。"""
+        def run(argv, timeout):
+            self.calls.append(argv)
+            return code
+        transport._run_cli = run
 
     def tearDown(self):
         transport._run_cli = self._orig_cli
@@ -129,3 +140,36 @@ class TransportTest(unittest.TestCase):
             transport.validate_resume_argv(["mcode", "it's"])
         with self.assertRaises(ValueError):
             transport.validate_resume_argv(["mcode"] + ["x"] * 64)
+
+    def test_null_reply_is_not_treated_as_success(self):
+        # null 不是 herdr 应答：既不能当成成功，也不能再让 TypeError 逃出 report()
+        self._fake_cli_code(1)
+        server = FakeSocketServer(self.sock_path, reply=b"null\n")
+        try:
+            ok = transport.report(self._env(HERDR_SOCKET_PATH=str(self.sock_path)),
+                                  state="working", seq=13)
+        finally:
+            server.close()
+        self.assertFalse(ok)
+        self.assertEqual(len(self.calls), 1)  # 确实回落到了 CLI，没被假成功短路
+
+    def test_non_object_reply_is_not_treated_as_success(self):
+        # 假阳性方向：数组里没有 "error" 就算成功，调用方会记下 herdr 不知道的状态
+        self._fake_cli_code(1)
+        server = FakeSocketServer(self.sock_path, reply=b"[1,2]\n")
+        try:
+            ok = transport.report(self._env(HERDR_SOCKET_PATH=str(self.sock_path)),
+                                  state="working", seq=14)
+        finally:
+            server.close()
+        self.assertFalse(ok)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_release_with_null_reply_returns_false(self):
+        self._fake_cli_code(1)
+        server = FakeSocketServer(self.sock_path, reply=b"null\n")
+        try:
+            ok = transport.release(self._env(HERDR_SOCKET_PATH=str(self.sock_path)), seq=15)
+        finally:
+            server.close()
+        self.assertFalse(ok)

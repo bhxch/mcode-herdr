@@ -1,7 +1,8 @@
 """把 mcode 钩子的 stdin JSON 解析成 Payload。
 
 字段名来自实测（见设计文档 §2.6/§2.8），解析保持宽容：
-缺失或空字符串一律归一为 None，避免下游到处判空。
+缺失、空字符串、纯空白字符串一律归一为 None，非空字符串去掉首尾空白，
+避免下游到处判空，也避免带空白的 id 被原样拼进 mcode 恢复命令。
 """
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ class Payload:
 
 def _text(value: Any) -> Optional[str]:
     if isinstance(value, str) and value.strip():
-        return value
+        return value.strip()
     return None
 
 

@@ -1,8 +1,7 @@
-import json
 import unittest
 from pathlib import Path
 
-from mcode_herdr.payload import Payload, load_payload
+from mcode_herdr.payload import load_payload
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -43,6 +42,30 @@ class PayloadTest(unittest.TestCase):
     def test_malformed_json_raises(self):
         with self.assertRaises(ValueError):
             load_payload("not json")
+
+    def test_stop_hook_active_true_is_parsed(self):
+        p = load_payload('{"hook_event_name":"Stop","stop_hook_active":true}')
+        self.assertTrue(p.stop_hook_active)
+
+    def test_non_object_json_raises(self):
+        with self.assertRaises(ValueError):
+            load_payload("[1,2]")
+
+    def test_missing_hook_event_name_raises(self):
+        with self.assertRaises(ValueError):
+            load_payload('{"session_id":"mvs_x"}')
+
+    def test_empty_stdin_raises(self):
+        with self.assertRaises(ValueError):
+            load_payload("")
+
+    def test_text_values_are_stripped_and_blank_becomes_none(self):
+        p = load_payload(
+            '{"hook_event_name":"  PreToolUse  ","session_id":"  mvs_x  ","tool_name":"   "}'
+        )
+        self.assertEqual(p.event, "PreToolUse")
+        self.assertEqual(p.session_id, "mvs_x")
+        self.assertIsNone(p.tool_name)
 
 
 if __name__ == "__main__":

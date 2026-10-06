@@ -64,7 +64,10 @@ def decide(action: Action, payload: Payload, state: PaneState) -> Optional[Decis
         if not sid:
             return None
         if state.last_reported == "working":
-            return None  # 父 agent 正在干活时新建的会话，只可能是子代理
+            # 父 agent 正在干活时新建的会话，只可能是子代理。
+            # 前提是「这份 working 一定来自一台活着的 mcode」，这个前提由 store 兜住：
+            # 归属进程已经失活的状态在 load 时就被丢成空状态，走不到这里。
+            return None
         return Decision(
             kind=Decision.Kind.REPORT,
             state="idle",

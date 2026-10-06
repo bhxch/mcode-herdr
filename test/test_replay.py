@@ -9,7 +9,8 @@ import time
 import unittest
 from pathlib import Path
 
-from mcode_herdr.store import Store
+from mcode_herdr.env import OWNER_PID, OWNER_START, read_starttime
+from mcode_herdr.store import PaneState, Store
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -98,6 +99,10 @@ class ReplayTest(unittest.TestCase):
         self.fake = self.data / "herdr"
         (self.data / "fake-proc").mkdir()
         self.set_herdr_exit(0)
+        # 归属 = 本测试进程：生产里这一对键是 herdr-report.py 在派生前回溯到 mcode 后
+        # 注入 worker 的，这里手工注入等价的形状。判活查的是真 /proc，所以必须是真 pid。
+        self.owner_pid = str(os.getpid())
+        self.owner_start = read_starttime(os.getpid(), Path("/proc"))
         self.env = {
             "PATH": os.environ["PATH"],
             "HOME": os.environ["HOME"],
@@ -105,10 +110,31 @@ class ReplayTest(unittest.TestCase):
             "HERDR_PANE_ID": "w9:p9",
             "HERDR_BIN_PATH": str(self.fake),
             "HERDR_SOCKET_PATH": str(self.data / "nonexistent.sock"),
+            OWNER_PID: self.owner_pid,
+            OWNER_START: self.owner_start,
         }
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def _dead_pid(self):
+        """一个确实已经不在了的 pid：真起一个进程，等它被回收干净。"""
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        self.assertFalse(Path("/proc/%d" % proc.pid).exists(),
+                         "刚回收的 pid 已经被复用，换个时间点再跑")
+        return str(proc.pid)
+
+    def _live_pid(self):
+        """另一个确实活着的 pid（连同它的启动指纹），用来冒充另一个 mcode。"""
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        return str(proc.pid), read_starttime(proc.pid, Path("/proc"))
+
+    def _seed_state(self, **fields):
+        store = Store(self.data)
+        store.save("w9:p9", PaneState(**fields))
 
     def set_herdr_exit(self, code):
         """落盘一份给定退出码的假 herdr。
@@ -456,7 +482,103 @@ class ReplayTest(unittest.TestCase):
         # 这里只断言 Store 确实被走过；状态是在那 1s 超时之后才落盘的，所以要等它。
         state_path = Store(self.data).path_for("w9:p9")
         self.wait_for(state_path.exists, "worker 把 pane 状态落到 PLUGIN_DATA")
-        self.assertEqual(json.loads(state_path.read_text())["root_session"], sid)
+        state = json.loads(state_path.read_text())
+        self.assertEqual(state["root_session"], sid)
+        # 归属必须也一起搬进 worker：它只有靠 HERDR_ 前缀的转发才到得了后台进程，
+        # 丢了这对键，pane 状态的判活就退化成「永远无法证明活着」
+        self.assertIsNotNone(state["owner_pid"])
+        self.assertIsNotNone(state["owner_start"])
+
+    def test_stuck_working_state_from_a_dead_mcode_does_not_swallow_the_new_session(self):
+        """P0 回归：写状态的 mcode 已经死了，这份状态就当没写过。
+
+        mcode 在一轮进行中被强杀，Stop 永远不会到达，last_reported 停在 working。
+        之后同一 pane 里新起的 mcode，它的 SessionStart 会被「working ⇒ 必然是子代理」
+        吞掉，root_session 永远建立不起来，后续钩子全部失效 —— pane 看起来永久忙碌，
+        没有任何东西会自己恢复它（README §9.2 记的就是这个）。归属进程已死就是判据。
+        """
+        self._seed_state(root_session="mvs_dead", last_reported="working",
+                         owner_pid=self._dead_pid(), owner_start="1")
+        sid = "mvs_fresh"
+        run("session-start", json.dumps({"hook_event_name": "SessionStart", "session_id": sid}),
+            self.env, self.data)
+        self.assertIn(f"--agent-session-id {sid}", self.calls()[-1])
+        self.assertEqual(self.state_file()["root_session"], sid)
+        # 认领之后这条会话自己的钩子必须真的生效，不能停在「认领得回来、之后全忽略」
+        run("user-prompt", json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": sid}),
+            self.env, self.data)
+        self.assertIn("--state working", self.calls()[-1])
+
+    def test_stuck_working_state_from_a_live_mcode_still_suppresses_subagents(self):
+        """子代理抑制规则不能被这个修复反过来打掉：mcode 还活着，working 就是真的在干活。"""
+        self._seed_state(root_session="mvs_root", last_reported="working",
+                         owner_pid=self.owner_pid, owner_start=self.owner_start)
+        run("session-start", json.dumps({"hook_event_name": "SessionStart", "session_id": "mvs_child"}),
+            self.env, self.data)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.state_file()["root_session"], "mvs_root")
+
+    def test_recycled_owner_pid_does_not_keep_the_pane_stuck(self):
+        # 归属 pid 还活着、却已经是另一个进程：只判 pid 存在与否的话，
+        # 死掉的 mcode 会被当成一直活着，这个 pane 就再也解不开
+        self._seed_state(root_session="mvs_dead", last_reported="working",
+                         owner_pid=self.owner_pid, owner_start="0")
+        sid = "mvs_fresh"
+        run("session-start", json.dumps({"hook_event_name": "SessionStart", "session_id": sid}),
+            self.env, self.data)
+        self.assertIn(f"--agent-session-id {sid}", self.calls()[-1])
+
+    def test_legacy_state_without_owner_is_adopted(self):
+        """已发布版本写下的状态没有归属字段：证明不了活着，就不能继续当证据。
+
+        恰恰是这类残留最需要被丢掉 —— 它们的 SessionStart 会被吞掉，于是永远等不到
+        一次新写入，也就永远不会被新版本接管。
+        """
+        path = Store(self.data).path_for("w9:p9")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"root_session": "mvs_legacy",
+                                    "blocked_by": None, "last_reported": "working"}))
+        sid = "mvs_fresh"
+        run("session-start", json.dumps({"hook_event_name": "SessionStart", "session_id": sid}),
+            self.env, self.data)
+        self.assertIn(f"--agent-session-id {sid}", self.calls()[-1])
+        self.assertEqual(self.state_file()["owner_pid"], self.owner_pid)
+
+    def test_every_save_path_stamps_the_owner_including_release(self):
+        """两条真正改动状态的路径都要盖上归属：认领那次，和 release 清空那次。"""
+        root = "mvs_root"
+        run("session-start", json.dumps({"hook_event_name": "SessionStart", "session_id": root}),
+            self.env, self.data)
+        self.assertEqual(self.state_file()["owner_pid"], self.owner_pid)
+        run("user-prompt", json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": root}),
+            self.env, self.data)
+        self.assertEqual(self.state_file()["owner_start"], self.owner_start)
+        # release 之前先把归属换成别人那台 mcode：不换的话，状态里本来就写着当前归属，
+        # 「release 盖了归属」和「release 没盖」在断言上长得一模一样，这条用例就没有牙齿
+        other, other_start = self._live_pid()
+        self._seed_state(root_session=root, last_reported="working",
+                         owner_pid=other, owner_start=other_start)
+        run("session-end", json.dumps({"hook_event_name": "SessionEnd", "session_id": root}),
+            self.env, self.data)
+        state = self.state_file()
+        self.assertIsNone(state["root_session"])               # release 确实清了业务字段
+        self.assertIsNone(state["last_reported"])
+        self.assertEqual(state["owner_pid"], self.owner_pid)   # 归属换成了交还 pane 的这台
+        self.assertEqual(state["owner_start"], self.owner_start)
+
+    def test_ignored_hook_does_not_steal_ownership(self):
+        """归属只在决策真的落到状态上时才转移。
+
+        子代理的钩子被忽略是常态；若空转的钩子也改归属，它等于把归属洗给「当前这个
+        pid」，真正持有 working 的老 mcode 一死，状态反而因为新归属还活着而永远解不开。
+        """
+        other, other_start = self._live_pid()
+        self._seed_state(root_session="mvs_root", last_reported="working",
+                         owner_pid=self.owner_pid, owner_start=self.owner_start)
+        run("session-start", json.dumps({"hook_event_name": "SessionStart", "session_id": "mvs_child"}),
+            dict(self.env, **{OWNER_PID: other, OWNER_START: other_start}), self.data)
+        self.assertEqual(self.calls(), [])   # 子代理语义没变
+        self.assertEqual(self.state_file()["owner_pid"], self.owner_pid)
 
     def test_hook_without_herdr_ancestry_reports_nothing(self):
         """祖先进程链上完全没有 HERDR_*：彻底静默，不上报、不建状态、不抛异常。

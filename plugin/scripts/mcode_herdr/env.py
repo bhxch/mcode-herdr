@@ -2,7 +2,8 @@
 
 mcode 的钩子只继承一份固定的白名单环境（PATH HOME LANG TERM SHELL 等十余项），
 HERDR_* 不在其中，所以只能从祖先进程的环境里取回。父进程号必须读 /proc/<pid>/status 的 PPid:，
-不能按位置解析 /proc/<pid>/stat —— comm 含空格或括号会错位。
+不能按位置解析 /proc/<pid>/stat —— comm 含空格或括号会错位；starttime 只存在于 stat，
+所以 read_starttime 从最后一个 ')' 之后开始数，不按空格切。
 
 回溯命中的那个祖先就是 mcode 自己，所以连它的身份（pid + 启动指纹）一起返回：
 状态文件靠这个判断「写这份状态的 mcode 是不是已经死了」。mcode 被 kill -9 之后

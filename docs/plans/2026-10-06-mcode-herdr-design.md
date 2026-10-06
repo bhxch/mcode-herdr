@@ -1,7 +1,12 @@
 # mcode × herdr 集成设计
 
 日期：2026-10-06
-状态：设计已确认，待实现
+状态：已实现。本文件是**设计记录**，不是现状说明书。
+
+阅读须知：设计是在推演中写成的，其中 `ask_user` 语义（§4.1）与子代理能力（§5.1）两条
+假设从未对过真机，已于 2026-10-06 按 mcode 0.6.3 真机实测证伪并改写。
+被证伪的原文**保留在原处并标注**，不做无痕替换 —— 需要知道「哪些结论是量出来的、
+哪些只是当时这么想的」的人，应当能一眼分清。每条实测结论都注明了依据。
 
 ## 1. 目标与背景
 
@@ -89,10 +94,15 @@ herdr 协议要点（来自官方文档）：
 
 **根因：`icon` 是必填字段。**
 
-`plugin/package/minimax-reader.ts` 的 `readManifest()` **无条件**调用 `readManifestIcon(value.icon)`，
-而该函数内部是 `requiredString(value, 'icon')` —— 缺失即 `MANIFEST_SCHEMA_INVALID`。
+`plugin/package/minimax-reader.ts` 解析清单时**无条件**要求 `icon` 字段（内部走
+`requiredString(value, 'icon')`），缺失即 `MANIFEST_SCHEMA_INVALID`。
 而 `readLocalPluginCandidate()` 把失败**写入 `diagnostics` 后静默跳过**，CLI 不暴露任何提示。
 因为官方插件全部带 `icon`，缺字段的本地包看起来就像「市场整体失效」。
+
+（修订说明：原文此处引用了 bundle 里一个负责读取 `icon` 的内层函数。该函数名在
+mcode 0.6.3 的 bundle 里 grep 命中数为 0，无法核实，所以改成上面这种只陈述可核实
+行为的写法；`requiredString(value, 'icon')`、`MANIFEST_SCHEMA_INVALID` 与「写进
+`diagnostics` 后静默跳过」这三点是复核过的，原文出处见 git 历史。）
 
 补上 `icon` 后立即生效：
 
@@ -120,15 +130,20 @@ herdr 协议要点（来自官方文档）：
 
 ### 2.7 第二个硬约束：钩子拿不到 `HERDR_*`
 
-`agent-modules/plugin-hooks/src/runner.ts` 中钩子子进程的环境是：
+`agent-modules/plugin-hooks/src/runner.ts` 中钩子子进程的环境是**按名字逐个挑出来的**
+（形如 `spawn(cmd, args, { env: { ...<白名单>, PLUGIN_ROOT: ..., PLUGIN_DATA: ... } })`），
+白名单里只有：
 
-```ts
-spawn(cmd, args, { env: { ...safeHookEnvironment(), PLUGIN_ROOT: ..., ... } })
+```
+PATH HOME LANG TERM SHELL USER TMPDIR TEMP TMP PATHEXT
+SystemRoot ComSpec USERPROFILE HOMEDRIVE HOMEPATH APPDATA LOCALAPPDATA
 ```
 
-`safeHookEnvironment()` 是**严格白名单**：`PATH HOME LANG TERM SHELL USER TMPDIR TEMP TMP PATHEXT
-SystemRoot ComSpec USERPROFILE HOMEDRIVE HOMEPATH APPDATA LOCALAPPDATA`。
-`HERDR_*` 不在其中，探针实测确认钩子里全部为空。
+`HERDR_*` 一个都不在其中，探针实测确认钩子里这些变量全部为空。
+
+（修订说明：原文给这个白名单构造起了一个函数名。该名字在 mcode 0.6.3 的 bundle 里
+grep 命中数为 0。白名单的**内容**是实测确认的（`HERDR_*` 到不了钩子），所以只有名字
+换成描述性说法，结论不变；原文见 git 历史。）
 
 **绕行方案（已验证可行）**：沿 `/proc` 父进程链回溯，找到第一个带 `HERDR_ENV=1` 的祖先即 mcode 进程。
 探针实测 depth=1 就命中 `comm=minimax-code`，成功取回 `HERDR_ENV / HERDR_PANE_ID / HERDR_TAB_ID /
@@ -150,6 +165,58 @@ HERDR_WORKSPACE_ID / HERDR_SOCKET_PATH / HERDR_BIN_PATH` 全套。
 改为「只为 `ask_user` 挂 matcher」后，钩子仅在真正需要上报 `blocked` 时才触发。
 fire-and-forget 仍然保留，但不再是高频路径。
 
+### 2.9 假设被证伪：`ask_user` 并不阻塞工具调用（2026-10-06 真机实测，mcode 0.6.3）
+
+§4/§5 原本假设「`ask_user` 的 `PostToolUse` 表示问卷已经被回答了」。**这个假设是错的**，
+它是从设计推演里来的，从未对过真机。订阅全部 11 个钩子事件、在交互式真机会话里跑一轮
+「问 → 人在 TUI 里作答」，同一次问答的事件时间线是：
+
+```
++0.0ms      SessionStart        turn=None
++23.5ms     UserPromptSubmit    turn=okj_na9epq    用户提交提示
++5794.5ms   PreToolUse          tool=ask_user
++5827.4ms   PostToolUse         tool=ask_user      （+33ms；terminate=true, details.waiting_for_user=true）
++5883.0ms   Stop                turn 结束，而问卷还开在 TUI 上
+   ... 人对着问卷作答，可以任意久 ...
++35819.8ms  UserPromptSubmit    turn=937719626f    人作答了 —— 这才是解障信号
++37488.2ms  Stop                续上的 turn 结束
+```
+
+`ask_user` 的真实 `tool_response`（节选）：
+
+```json
+"tool_response": {
+  "content": [{"type":"text","text":"Questionnaire ask_... is waiting for the local user. Stop this turn until the user replies."}],
+  "details": {"request_id":"ask_...", "schema_version":2, "step_count":1, "waiting_for_user": true},
+  "terminate": true
+}
+```
+
+三条与原假设**相反**的结论：
+
+1. **`ask_user` 不阻塞工具调用**。工具在 `PreToolUse` 之后 33ms 就返回了，返回时
+   `terminate=true`：turn 被要求就此收工，人还没回答。
+2. **`PostToolUse` 不是「已作答」的信号，恰恰相反**。它带
+   `details.waiting_for_user=true`，这是「问卷还开着、人还在等」的权威信号。
+3. **真正的解障信号是用户作答时重新发出的 `UserPromptSubmit`**。作答算作一次新的
+   用户提示，所以它带着一个全新的 `turn_id`（比上一轮晚约 27s）到达。
+
+由此还得到一条：**`Stop` 只表示 turn 结束，不表示问题已解决**。
+
+后果是可量化的。旧语义（`post-tool` 无条件翻 `working`、`stop` 无条件翻 `idle`）在
+真实 herdr 上量到的状态序列是：blocked 只存在 **121ms** 就被抹掉，紧接着又被翻成
+working、再翻成 done —— `herdr agent wait --until blocked` 基本永远等不到。
+按修正后的语义重测（0.1s 轮询真实 herdr 的 pane 状态）：
+
+```
++0ms idle | +2s working | +4s blocked ... held 15.8s ... +18s working | +19s done
+```
+
+blocked 一直挂到人作答为止，才被作答触发的那次 `UserPromptSubmit` 解开。
+
+样本留档在 `test/fixtures/post_tool_ask_user_waiting.json`（`tool_response` 为线上原值），
+来源逐项说明见 `test/fixtures/README.md`。
+
 ## 3. 交付形态
 
 **mcode 本地插件**。不走 wrapper 脚本（拿不到 `blocked` 和可靠的 `session_id`），不改 bundle（升级即丢）。
@@ -159,15 +226,24 @@ fire-and-forget 仍然保留，但不再是高频路径。
 ```
 /share/rw/repo/tools/mcode-herdr/
   .minimax-plugin/plugin.json   # 清单，声明 hooks
+  icon.png                      # 清单必填项，缺了整个插件被静默跳过（§2.5）
   hooks/hooks.json              # 事件 → 脚本映射，显式传事件名
-  scripts/herdr-report.sh       # 唯一上报脚本
-  install.sh                    # 同步到本地市场并安装
+  scripts/herdr-report.py       # 钩子入口：立刻派生后台进程后退出
+  scripts/worker.py             # 后台 worker
+  scripts/mcode_herdr/*.py      # env / payload / store / decide / transport / herdr / runtime
+  install.sh                    # 同步到本地市场并验证
   test/                         # 离线回放测试
   docs/plans/2026-10-06-mcode-herdr-design.md
 ```
 
-安装方式：脚本同步到 `~/.minimax/plugins/herdr/`，再 `mcode plugin add herdr -m local`。
-用**同步而非符号链接**——本地市场扫描器是否跟随 symlink 未验证，同步是确定可用的路径；代价是改完代码需重跑 `install.sh`。
+（原文此处写的是 `scripts/herdr-report.sh` 与「同步到 `~/.minimax/plugins/herdr/`，
+再 `mcode plugin add herdr -m local`」。交付形态后经 §2.4/§2.5 修正为 Python 入口 +
+`mcode-herdr` 目录名，且**不需要任何安装命令**。）
+
+安装方式：脚本把 `plugin/` 同步到 `~/.minimax/plugins/mcode-herdr/`（默认 profile；
+其他 profile 用 `MINIMAX_DATA_DIR` 覆盖），被扫描到即 installed + enabled。
+用**同步而非符号链接**——本地市场扫描器显式拒绝符号链接（§2.4 的 `rejectSymlink`），
+软链方案根本进不来；代价是改完代码需重跑 `install.sh`。
 
 ## 4. 钩子与状态机
 
@@ -175,15 +251,35 @@ fire-and-forget 仍然保留，但不再是高频路径。
 
 | 钩子 | 根会话动作 | 子代理动作 |
 |------|-----------|-----------|
-| `session-start` | pane 空闲或未持有 agent → 接受为新根；上报 `idle` + 会话身份 + 恢复命令 | pane 正 `working` → **忽略** |
-| `user-prompt` | → `working` | 忽略 |
-| `pre-tool` 且 `tool_name=ask_user` | → `blocked`，`--message` 说明在等决策 | → `blocked` |
-| `post-tool` 且 `tool_name=ask_user` | → 回 `working` | 仅当 blocked 是自己置位的才回，否则忽略 |
-| `stop` | → `idle` | **忽略** |
-| `session-end` | `release-agent`（仅当结束的正是当前会话） | 忽略 |
+| `session-start` | 无 `session_id` → 忽略；`last_reported == "working"` → **忽略**（判定为子代理创建）；否则上报 `idle` + 会话身份 + 恢复命令，并认领新的 `root_session` | 同左：pane 正在干活时到达的 `SessionStart` 一律忽略 |
+| `user-prompt` | 会话 == `root_session` → `working`，**并清掉 `blocked`** | 忽略 |
+| `pre-tool` 且 `tool_name=ask_user` | → `blocked`，`--message` 说明在等决策，记 `blocked_by = 本会话` | → `blocked`，`blocked_by = 子会话` |
+| `post-tool` 且 `tool_name=ask_user` | `details.waiting_for_user == true` → **忽略，保持 `blocked`**；否则（无待答问卷的防御性路径）→ `working`，清 `blocked` | 同左，且只认自己置的位 |
+| `stop` | 会话 != `root_session` → **忽略**；**`blocked_by` 非空 → 忽略**；否则 → `idle` | **忽略** |
+| `session-end` | `release-agent`（仅当结束的正是当前会话）并清空该 pane 状态 | 忽略 |
 
 `session-start` 必须先于恢复命令发送，否则 herdr 返回 `resume_not_accepted`。
-`--source` 固定 `mcode`，`--agent` 固定 `mcode`（不与 herdr 已支持的 agent 重名）。
+`--source` 固定 `mcode-herdr`，`--agent` 固定 `mcode`（不与 herdr 已支持的 agent 重名）。
+
+### 4.1 这里原本写的规则已被证伪
+
+本节最初的表格里，`post-tool` 那一行是：
+
+> `post-tool` 且 `tool_name=ask_user` | → 回 `working` | 仅当 blocked 是自己置位的才回，否则忽略
+
+并配了 §5 的一段论证「**`post-tool` 要认「谁置的位」**。状态文件记 `blocked_by`，
+子代理的 post 只能清自己置的 blocked，否则会误清根会话正等待的决策」。
+
+**这两条已被 §2.9 的真机实测证伪**：`ask_user` 的 `PostToolUse` 是在人作答**之前**
+就到的，而且带的正是「问卷还开着」的 `waiting_for_user=true`。照旧规则实现，
+blocked 平均只存在 121ms（见 §2.9 的前后对比）。原始表格与论证保留在上表与 §5 原地，
+不再作为有效规则。
+
+改写后的规则只有一句话：**清 `blocked` 的正常路径只有一条 —— 用户作答触发的
+`user-prompt`**。`post-tool` 只在没有待答问卷时才允许清（防御性路径，为将来
+`ask_user` 真的一路阻塞到作答为止时准备），`stop` 在 `blocked_by` 非空时一律不翻 idle。
+`blocked_by` 字段保留，但用途从「`post-tool` 的归属仲裁」缩成
+「pane 是否正卡在一份待答问卷上」的持久标志。
 
 ## 5. 子代理处理
 
@@ -192,10 +288,33 @@ fire-and-forget 仍然保留，但不再是高频路径。
 
 两个关键取舍：
 
-- **`blocked` 是例外**。子代理完全可能调 `ask_user`，此时 pane 确实卡在人身上，必须报 blocked。
+- **`blocked` 是例外**。子代理**可能**调 `ask_user`，此时 pane 确实卡在人身上，必须报 blocked。
   若按「子代理一律忽略」处理，会出现 herdr 侧显示 `working` 却收不到通知的错配。
 - **`post-tool` 要认「谁置的位」**。状态文件记 `blocked_by`，子代理的 post 只能清自己置的 blocked，
   否则会误清根会话正等待的决策。
+
+（这两条取舍的前提已被 §5.1 推翻：`ask_user` 的 `PostToolUse` 不是解障信号，见 §4.1；
+子代理调不到 `ask_user`，见 §5.1。文字原样保留，用于说明当时的推理路径。）
+
+### 5.1 已解决：mcode 0.6.3 的子代理根本没有 `ask_user` 这个工具
+
+「子代理也可能调 `ask_user`」这个前提，在 mcode 0.6.3 上**不成立**。真机分别派了
+`explore` 与 `mavis` 两种子代理去尝试提问，两者独立报告 `ask_user` 对自己不可用、
+只有顶层 agent 能调：`explore` 报出自己的可用工具是 bash / glob / grep / read /
+web_fetch（没有 `ask_user`），`mavis` 说这个问题只能从父层问。
+
+**这条曾是开放风险，现在结案**：
+
+- `decide.py` 里「子代理调 `ask_user` → 仍报 `blocked`」的例外分支是**防御性 / 前瞻性**的，
+  在 mcode 0.6.3 上**走不到**。回放测试里那条用例是用构造载荷覆盖的，不是真实抓包。
+- 子代理的 `session_id` 管道**保留**：`blocked_by` 记子会话、子会话自己的
+  `UserPromptSubmit` 一律忽略、只有根会话的 `user-prompt` 能解障 —— 这套管道是照着
+  「子代理能提问」设计的，留着是为了 mcode 下一版真把 `ask_user` 暴露给子代理时不用改设计。
+
+### 5.2 真机验证过的子代理行为
+
+在真机上派子代理干活、期间持续轮询 herdr 的 pane 状态：**一直是 `working`，
+从未被翻成 `idle`**。「父 agent 在子代理还在干活时不能看起来已完成」这条要求成立。
 
 ## 6. 上报协议：双通道
 
@@ -216,8 +335,18 @@ fire-and-forget 仍然保留，但不再是高频路径。
 - **后台化**：真正的工作用 `setsid` 脱离进程组，钩子立刻 `exit 0`，自带输出重定向到 `/dev/null`。
   钩子挂在内联路径上，必须近乎瞬时。
 - **状态文件原子写**：`tmp + mv`；读到半个文件按「无根会话」处理，绝不阻塞。
-- **乱序容忍**：`--seq` 用 `time.time_ns()`，herdr 侧负责丢弃过期报告，无需自建队列合并。
+- **乱序容忍**：`--seq` 用 `time.monotonic_ns()`，herdr 侧负责丢弃过期报告，无需自建队列合并。
+  （原文此处写的是 `time.time_ns()`。必须用**单调**时钟：NTP 回步或校时能把墙上时钟
+  拨回，而 seq 没有变大时 herdr 会**静默丢弃该次上报却照样回 ok** —— 调用方无从察觉，
+  却已经把状态记下了。）
 - **`resume_not_accepted` 不重试**，仅记录日志。
+- **herdr 环境必须在派生 worker 之前由钩子自己解析**（真机实测踩过，见下）。
+  后台 worker 一旦脱离，它的 `/proc` 父链就断在 init（`start_new_session` 只换会话组，
+  不改父子关系；父进程一退出，worker 即被 init 收养），`env.py` 里 `pid<=1` 的守卫
+  立刻返回 `None`，上报静默消失 —— 钩子照常触发，状态文件一个都不写，
+  `herdr agent list` 永远为空。真机量到过 `worker MY_PPID = 1`、
+  `discover_herdr_env() -> None` 的现场。所以父链只在钩子进程自己身上是完整的，
+  必须在派生前读出来、经 `env=` 传给 worker；解析不到时连 worker 都不派生。
 
 每 pane 一个状态文件，记录：`root_session_id`、`blocked_by`、`last_state`。
 
@@ -247,26 +376,34 @@ fire-and-forget 仍然保留，但不再是高频路径。
 `herdr agent list` 断言出现 `mcode` 且状态流转正确 →
 `herdr session stop` 再 start，断言 pane 自动跑起恢复命令且会话 id 一致。
 
-子代理专项：子 agent 调 `ask_user`，断言 blocked 正确、结束后不被误清。
+子代理专项：派子代理干活，断言父 pane 全程停在 `working`、不被误翻 `idle`
+（真机已验证，见 §5.2）。「子代理调 `ask_user`」在 mcode 0.6.3 上无法构造
+（见 §5.1），只以构造载荷覆盖状态机分支。
 
 全程不触碰用户当前会话。
 
 ## 9. 待验证假设
 
-1. mcode 钩子 stdin 载荷中会话标识的确切字段名（`session_id` 还是 camelCase）。
-2. `tool_name` 的确切字段名，以及子代理上下文中工具名是否被改写。
-3. `Stop` 的真实触发时机：模型跑完即触发，还是会等后台任务结束。
-   若过早触发会导致「仍有后台任务时误报 idle」。
-4. 本地插件市场扫描器是否跟随符号链接（本设计用同步规避，但若跟随 symlink 则同步可省去）。
-5. `mcode exec` 是否触发钩子；若不触发，探针需改用交互式或临时 TUI。
+以下五条原始假设的**核查结果**。留表而不是删掉，是为了标出「哪些是量出来的」：
+
+| # | 原始假设 | 核查结果 |
+|---|---------|---------|
+| 1 | mcode 钩子 stdin 载荷中会话标识的确切字段名（`session_id` 还是 camelCase） | **已核对**：`session_id`。§2.6 的实测载荷里字段名与 Claude Code 完全一致 |
+| 2 | `tool_name` 的确切字段名，以及子代理上下文中工具名是否被改写 | **已核对**：`tool_name` 不被改写。子代理路径额外带 `agent_id` / `agent_type`，但状态机不依赖它们（§4），所以 §2.3 的「不按字段名判断」这条设计仍然成立 |
+| 3 | `Stop` 的真实触发时机：模型跑完即触发，还是会等后台任务结束 | **部分核对，且与直觉相反**：`ask_user` 的 turn 在人作答**之前**就结束（§2.9）。「仍有后台任务时误报 idle」这一支**没有**单独验证过 |
+| 4 | 本地插件市场扫描器是否跟随符号链接 | **已核对**：不跟随（§2.4 的 `rejectSymlink`）。所以「同步而非软链」不是保守选择，是唯一可行路径 |
+| 5 | `mcode exec` 是否触发钩子 | **已核对**：会。§2.6/§2.8 的实测样本均来自 `mcode exec`；交互式会话另测过一轮（§2.9） |
+
+§9 之外后来又补了两条实测结论，都不在原始假设表里：§2.9（`ask_user` 语义）
+与 §5.1（子代理没有 `ask_user`）。
 
 ## 10. 实施步骤
 
 1. 写载荷探针插件，跑 `mcode exec` 拿到真实载荷 → 确定字段名，回写解析逻辑。
-2. 实现 `herdr-report.sh`（状态机 + 子代理过滤 + 双通道上报 + 状态文件）。
-3. 写 `hooks.json` 与 `plugin.json`。
+2. 实现 `herdr-report.py`（钩子入口）+ `worker.py` + `mcode_herdr/`（状态机 + 子代理过滤 + 双通道上报 + 状态文件）。
+3. 写 `hooks.json` 与 `plugin.json`（`icon` 必填，见 §2.5）。
 4. 写离线回放测试并跑绿。
-5. 写 `install.sh`（同步 + `mcode plugin add -m local`）。
+5. 写 `install.sh`（同步 + 验证；本地插件**不需要** `mcode plugin add`，见 §2.5）。
 6. 端到端验证（含子代理专项）。
 7. 写 README，提交。
 

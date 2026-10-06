@@ -1,7 +1,7 @@
 """通过 /proc 父进程链回溯，找出带 HERDR_ENV=1 的祖先（即 mcode 进程）。
 
-mcode 的钩子只继承 safeHookEnvironment() 白名单环境，HERDR_* 不会传入子进程，
-所以只能从祖先进程的环境里取回。父进程号必须读 /proc/<pid>/status 的 PPid:，
+mcode 的钩子只继承一份固定的白名单环境（PATH HOME LANG TERM SHELL 等十余项），
+HERDR_* 不在其中，所以只能从祖先进程的环境里取回。父进程号必须读 /proc/<pid>/status 的 PPid:，
 不能按位置解析 /proc/<pid>/stat —— comm 含空格或括号会错位。
 """
 from __future__ import annotations

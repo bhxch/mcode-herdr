@@ -24,9 +24,11 @@ def _resume_argv(session_id: Optional[str]) -> list:
 
 
 def _resolve_herdr_env(env: Mapping[str, str], proc_root: Optional[Path]) -> Optional[Mapping[str, str]]:
-    # 第一条分支在生产环境不可达：mcode 的钩子环境是白名单拼的，里面没有 HERDR_*。
-    # 它是给「人在 herdr pane 里手动跑 worker.py」用的 —— 那种情况 os.environ 里本来就有
-    # HERDR_*，直接采信即可，不必再翻 /proc；回放测试也靠它注入假环境。删掉会让手动路径失灵。
+    # 显式分支是生产主路径：herdr-report.py 在派生 worker 之前就把回溯结果注入子进程
+    # 环境，因为 worker 一旦被 reparent 到 init 就再也走不回 /proc 祖先进程链。
+    # 它同时覆盖「人在 herdr pane 里手动跑 worker.py」和回放测试注入假环境两种情况。
+    # 回退到 /proc 只在既没有显式 HERDR_* 又确实还在 mcode 进程树里时才会命中。
+    # 删掉第一条分支会让整个插件静默失效（herdr agent list 永远为空）。
     if env.get("HERDR_ENV") == "1" and env.get("HERDR_PANE_ID"):
         return {k: v for k, v in env.items() if k.startswith("HERDR_")}
     return discover_herdr_env(proc_root=proc_root or Path("/proc"))

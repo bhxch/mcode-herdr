@@ -29,13 +29,30 @@ echo "==> 验证插件已被本地市场识别"
 mcode plugin list -m local --available | grep -E '^.\*\].*mcode-herdr@local' \
   || { echo "未识别！请检查 plugin.json 是否有 icon 字段（必填，缺失会被静默跳过）" >&2; exit 1; }
 
-echo "==> 检查恢复命令的 mcode 是否在登录 shell 的 PATH 上"
-if ! env -i /bin/sh -lc 'command -v mcode' >/dev/null 2>&1; then
+echo "==> 检查恢复命令的 mcode 是否可被 herdr 执行"
+# 恢复命令是 `--` 后的裸命令名 `mcode`，由 herdr server 所在环境去解析，
+# 不是由登录 shell 解析。之前这里用 `env -i /bin/sh -lc` 判断，而登录 shell
+# 不读 ~/.bashrc（本机 mcode 的 PATH 正是 ~/.bashrc:36 加的），于是无论
+# mcode 是否真的可用都会误报。改为分两级：先看当前环境，再看 herdr server
+# 自己的 PATH（也就是真正执行恢复命令的那份环境）。
+resume_ok=0
+if command -v mcode >/dev/null 2>&1; then
+  resume_ok=1
+elif command -v pgrep >/dev/null 2>&1; then
+  for pid in $(pgrep -x herdr 2>/dev/null); do
+    if tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep '^PATH=' | tr ':' '\n' \
+        | grep -q '/mcode$'; then
+      resume_ok=1
+      break
+    fi
+  done
+fi
+if [ "$resume_ok" -eq 0 ]; then
   cat >&2 <<'EOF'
-警告：登录 shell 的 PATH 上找不到 mcode。
-herdr 恢复会话时会执行 `--` 后的裸命令名 `mcode`，找不到会导致恢复失败。
-建议：ln -s "$(command -v mcode)" ~/.local/bin/mcode
-      并确保 ~/.local/bin 在登录 shell 的 PATH 中。
+警告：herdr 恢复会话时要执行的裸命令名 `mcode` 当前解析不到，恢复会失败。
+herdr server 继承启动它的终端环境；若那里也没有 mcode，可执行：
+      ln -s "$(command -v mcode)" ~/.local/bin/mcode
+然后重启 herdr server 让它带上新的 PATH。
 EOF
 fi
 

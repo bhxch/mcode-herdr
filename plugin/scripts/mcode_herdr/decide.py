@@ -59,7 +59,7 @@ def decide(action: Action, payload: Payload, state: PaneState) -> Optional[Decis
     if name == "user-prompt":
         if not root or payload.session_id != root:
             return None
-        return _report("working", state)
+        return _report("working", state, clear_blocked=True)
 
     if name == "pre-tool":
         if payload.tool_name != ASK_USER:

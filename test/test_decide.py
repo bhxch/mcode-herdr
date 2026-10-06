@@ -40,6 +40,13 @@ class DecideTest(unittest.TestCase):
         st = PaneState(root_session=ROOT, last_reported="working")
         self.assertIsNone(decide(Action("user-prompt"), p("UserPromptSubmit", session_id=CHILD), st))
 
+    def test_user_prompt_from_root_clears_pending_blocked_by_child(self):
+        # 用户在父会话提了新问题，子代理待答的提问已被接管，不该再算有人被阻塞
+        st = PaneState(root_session=ROOT, blocked_by=CHILD, last_reported="blocked")
+        d = decide(Action("user-prompt"), p("UserPromptSubmit"), st)
+        self.assertEqual(d.state, "working")
+        self.assertIsNone(d.blocked_by)
+
     def test_ask_user_pretool_root_reports_blocked(self):
         d = decide(Action("pre-tool"), p("PreToolUse", tool_name="ask_user"), PaneState(root_session=ROOT))
         self.assertEqual(d.state, "blocked")

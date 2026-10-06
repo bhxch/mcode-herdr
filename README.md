@@ -279,8 +279,20 @@ local       directory    <dataDir>/plugins      # 默认 ~/.minimax/plugins
 ```
 
 它先对**当前所在 pane** 执行 `herdr pane release-agent`（否则 herdr 会继续把这个 pane
-显示为有 agent），再删掉安装目录。其他 pane 里的残留占用要自己
+显示为有 agent），再**写一条本地禁用记录**，最后删掉安装目录。其他 pane 里的残留占用要自己
 `herdr pane release-agent <PANE_ID> --source mcode-herdr --agent mcode --seq <N>` 清理。
+
+禁用记录放在删除之前，是为了让**删不掉**的情况也安全：如果 `rm -rf` 因权限等原因失败，
+`set -e` 会中止脚本，而留在原地的插件此时已经是 `disabled`，不会在你声明卸载之后继续上报：
+
+```
+卸载前:                  [*] mcode-herdr@local  enabled
+卸载在 rm 处中断:         [-] mcode-herdr@local  disabled   ← 目录还在，但是禁用的
+```
+
+注意这条记录**不会**在卸载后长期存在——目录一旦删掉，mcode 会在下次扫描时自动清理这条孤立
+记录（源码里的 `pruneMissingLocalPlugins`）。所以它只兜住「没删干净」这一种情况，
+不构成卸载后的长期标记；重装是一次全新的启用。
 
 release 的 `seq` 取自 `/proc/uptime` 换算，而不是 `date +%s`。原因见
 [§9.5](#95-uninstallsh-的-release-seq-取自-procuptime)—— 这条约束对任何新增的

@@ -58,6 +58,87 @@ herdr 协议要点（来自官方文档）：
 载荷里出现 `agent_name` / `subagent_type`，且存在把 `subagent_type` 改名成 `agent_name` 的转换逻辑。
 因此**不依赖字段名做判断**。
 
+### 2.4 阻塞项：CLI 侧本地插件市场不可用（2026-10-06 实测）
+
+原方案依赖 `mcode plugin add -m local` 安装插件。实测结论：**在 mcode 0.6.3 CLI 上这条路走不通。**
+
+已验证的事实：
+
+1. `mcode plugin list -m local --available --json` 恒为 `{"installed":[],"available":[]}`。
+   **对照实验**：把已验证可用的 lark 插件（来自官方 registry）完整复制进 `~/.minimax/plugins/lark`
+   后依然扫不到。**排除清单格式问题**，是扫描本身不工作。
+2. bundle 中存在 `mutateLocal(e,r){if(r==="install")throw new ai("LOCAL_PLUGIN_INSTALL_UNSUPPORTED")}`
+   ——本地插件的 `install` 被显式拒绝。
+3. `mcode plugin add` 的所有形式均失败：裸名、`@local`、绝对路径、相对路径、末尾斜杠。
+4. `importGithubPlugin` 是 DesktopService 的 HTTP 接口（`/minimax-desktop/api/v1/plugins/github/import`），
+   CLI 不可用，不构成替代通道。
+5. 钩子**只能**来自插件：`hooks/hooks.json` 是 bundle 里唯一的钩子清单常量，
+   `config.yaml` 无 hooks 段，也无用户级 hooks 文件。
+6. 官方 registry 通道正常（18 个插件正常启用），lark 的 SessionStart 钩子在本会话确实触发过，
+   说明**插件钩子机制本身是好的，只是本地插件进不来**。
+
+另有两个扫描器约束（供后续参考）：目录型市场**拒绝符号链接**（`rejectSymlink:!0`），
+且校验失败会被写入 `diagnostics` **静默跳过**，无 CLI 可见性。
+
+**结论**：插件形态在此版本不可交付，需要改方案。详见 §11。
+
+### 2.5 阻塞项已解决（2026-10-06，基于 `github/minimax-code` 源码）
+
+查 `packages/local-runtime-v2/src/service/plugin-system/` 源码后定位到真正原因，并已实测验证。
+
+**根因：`icon` 是必填字段。**
+
+`plugin/package/minimax-reader.ts` 的 `readManifest()` **无条件**调用 `readManifestIcon(value.icon)`，
+而该函数内部是 `requiredString(value, 'icon')` —— 缺失即 `MANIFEST_SCHEMA_INVALID`。
+而 `readLocalPluginCandidate()` 把失败**写入 `diagnostics` 后静默跳过**，CLI 不暴露任何提示。
+因为官方插件全部带 `icon`，缺字段的本地包看起来就像「市场整体失效」。
+
+补上 `icon` 后立即生效：
+
+```
+[*] herdr-probe@local	enabled
+```
+
+另据 `docs/examples.md`：**本地插件不是通过 `plugin add` 安装的**（`mcode plugin add <name>@local`
+是 Desktop 功能，CLI 不支持），而是把包放进 `dataDir/plugins/` 下的直接子目录；
+**被发现的本地包直接就是 installed + enabled**，无需任何安装命令。
+`mcode plugin marketplace list` 打印的目录即活动 profile 的目录。
+
+### 2.6 实测载荷（`mcode exec` 捕获，`probe/scripts/dump.sh`）
+
+```jsonc
+// SessionStart
+{"source":"startup","hook_event_name":"SessionStart","session_id":"mvs_d662...","transcript_path":"...","cwd":"...","model":"...","permission_mode":"auto"}
+// UserPromptSubmit 额外含 prompt、turn_id
+// Stop            额外含 stop_hook_active、last_assistant_message
+```
+
+字段名与 Claude Code 完全一致（`hook_event_name` / `session_id` / `cwd` / `model`）。
+`runner.ts` 的事件必填字段表还确认了：`PreToolUse` 需 `tool_name`+`tool_input`+`tool_use_id`，
+`PostToolUse` 额外需 `tool_response`，`SubagentStart`/`SubagentStop` 需 `agent_id`+`agent_type`。
+
+### 2.7 第二个硬约束：钩子拿不到 `HERDR_*`
+
+`agent-modules/plugin-hooks/src/runner.ts` 中钩子子进程的环境是：
+
+```ts
+spawn(cmd, args, { env: { ...safeHookEnvironment(), PLUGIN_ROOT: ..., ... } })
+```
+
+`safeHookEnvironment()` 是**严格白名单**：`PATH HOME LANG TERM SHELL USER TMPDIR TEMP TMP PATHEXT
+SystemRoot ComSpec USERPROFILE HOMEDRIVE HOMEPATH APPDATA LOCALAPPDATA`。
+`HERDR_*` 不在其中，探针实测确认钩子里全部为空。
+
+**绕行方案（已验证可行）**：沿 `/proc` 父进程链回溯，找到第一个带 `HERDR_ENV=1` 的祖先即 mcode 进程。
+探针实测 depth=1 就命中 `comm=minimax-code`，成功取回 `HERDR_ENV / HERDR_PANE_ID / HERDR_TAB_ID /
+HERDR_WORKSPACE_ID / HERDR_SOCKET_PATH / HERDR_BIN_PATH` 全套。
+
+注意：用 `/proc/<pid>/status` 的 `PPid:` 取父进程号，不要用 `/proc/<pid>/stat` 按位置解析——
+`comm` 含空格或括号会错位（探针第一版就因此只回溯到 depth=0）。
+
+该方案是 Linux 专属。非 Linux 上取不到 pane 上下文，按 herdr 约定「不在 herdr 里就什么都不做」，
+退化为无操作即可——这恰好是正确的降级行为。
+
 ## 3. 交付形态
 
 **mcode 本地插件**。不走 wrapper 脚本（拿不到 `blocked` 和可靠的 `session_id`），不改 bundle（升级即丢）。

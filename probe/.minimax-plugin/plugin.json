@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "name": "herdr-probe",
+  "displayName": "herdr probe",
+  "version": "0.0.1",
+  "description": "一次性探针：把钩子收到的 stdin 与环境变量原样落盘，用于确定 mcode 载荷字段名。确认后即卸载。",
+  "author": "mavis",
+  "icon": "icon.png",
+  "category": "Other",
+  "exampleQueries": [],
+  "apps": [],
+  "mcpServers": [],
+  "skills": [],
+  "hooks": [
+    "hooks/hooks.json"
+  ]
+}

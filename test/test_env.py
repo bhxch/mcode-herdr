@@ -3,7 +3,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from mcode_herdr.env import MAX_ANCESTRY, discover_herdr_env, read_environ, read_ppid
+from mcode_herdr.env import (MAX_ANCESTRY, OWNER_PID, OWNER_START, discover_herdr_env,
+                             read_environ, read_ppid, read_starttime)
 
 HERDR_ENV_VARS = [
     "HERDR_ENV=1",
@@ -11,6 +12,19 @@ HERDR_ENV_VARS = [
     "HERDR_BIN_PATH=/opt/herdr",
     "HERDR_SOCKET_PATH=/tmp/s",
 ]
+
+# starttime 是 stat 的第 22 个字段；第 3 个字段（state）起的每个字段在 ')' 之后是第 k 个 token。
+STARTTIME = "424242"
+
+
+def stat_line(pid, comm, ppid, starttime=STARTTIME):
+    """造一行 /proc/<pid>/stat。
+
+    comm 默认带空格和右括号：真实进程名就是这样（"weird )name"），
+    解析必须从最后一个 ')' 之后开始，按空格或第一个 ')' 切都会错位。
+    """
+    tail = ["S", str(ppid)] + ["0"] * 17 + [str(starttime)]
+    return "%d (%s) %s\n" % (pid, comm, " ".join(tail))
 
 
 class EnvDiscoveryTest(unittest.TestCase):
@@ -21,11 +35,13 @@ class EnvDiscoveryTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _make_proc(self, pid, ppid, env):
+    def _make_proc(self, pid, ppid, env, starttime=None):
         d = self.proc / str(pid)
         d.mkdir(parents=True)
         (d / "environ").write_bytes(("\0".join(env) + "\0").encode())
         (d / "status").write_text(f"Name:\tpid\nPPid:\t{ppid}\n")
+        if starttime is not None:
+            (d / "stat").write_text(stat_line(pid, "weird )name", ppid, starttime))
         return d
 
     def _make_chain(self, base, length, top_env):
@@ -133,6 +149,53 @@ class EnvDiscoveryTest(unittest.TestCase):
 
     def test_read_environ_missing_proc_returns_empty(self):
         self.assertEqual(read_environ(4242, self.proc), {})
+
+    def test_reads_starttime_from_stat_after_the_last_paren(self):
+        # 归属进程的启动指纹只存在于 stat：status 里没有这一项
+        d = self._make_proc(7, 5, ["PATH=/bin"], starttime=STARTTIME)
+        self.assertEqual(read_starttime(7, self.proc), STARTTIME)
+        # 换成"comm 里有右括号"的进程名，值必须不变：按第一个 ')' 或按空格切都会偏掉 19 个字段
+        d.joinpath("stat").write_text(stat_line(7, "a) b", 5, "999"))
+        self.assertEqual(read_starttime(7, self.proc), "999")
+
+    def test_read_starttime_missing_or_malformed(self):
+        self.assertIsNone(read_starttime(4242, self.proc))   # 没有这个进程
+        d = self._make_proc(7, 5, ["PATH=/bin"])
+        self.assertIsNone(read_starttime(7, self.proc))       # stat 整个缺失
+        d.joinpath("stat").write_text("7 (short) S 1\n")     # 字段不够，starttime 取不到
+        self.assertIsNone(read_starttime(7, self.proc))
+        d.joinpath("stat").write_text("7 (x) S 1 " + "0 " * 30 + "\n")  # 读到了但不是数字
+        self.assertIn(read_starttime(7, self.proc), (None, "0"))           # 原样记号或 None，不抛
+
+    def test_discovery_reports_the_matched_ancestor_as_owner(self):
+        # 命中的那个祖先就是 mcode 自己；把它的 pid + 启动指纹一并带出去，
+        # 状态文件才能判断「写这份状态的 mcode 是不是已经死了」
+        self._make_proc(100, 101, ["PATH=/bin"], starttime="1")
+        self._make_proc(101, 102, ["PATH=/bin"], starttime="2")
+        self._make_proc(102, 1, HERDR_ENV_VARS, starttime=STARTTIME)
+        got = discover_herdr_env(proc_root=self.proc, start_pid=100)
+        self.assertIsNotNone(got)
+        self.assertEqual(got[OWNER_PID], "102")          # 是命中者，不是回溯起点
+        self.assertEqual(got[OWNER_START], STARTTIME)
+
+    def test_owner_keys_stay_inside_the_herdr_prefix_filter(self):
+        # 前缀过滤是 runtime/worker 搬运归属信息的唯一通道：
+        # runtime._resolve_herdr_env 只转发 HERDR_*，键名一旦不满足前缀，归属就静默丢失
+        self._make_proc(100, 1, ["PATH=/bin", *HERDR_ENV_VARS], starttime=STARTTIME)
+        got = discover_herdr_env(proc_root=self.proc, start_pid=100)
+        self.assertIsNotNone(got)
+        self.assertTrue({OWNER_PID, OWNER_START} <= set(got))
+        self.assertTrue(all(k.startswith("HERDR_") for k in (OWNER_PID, OWNER_START)))
+        self.assertEqual({k: v for k, v in got.items() if k.startswith("HERDR_")}, dict(got))
+
+    def test_discovery_omits_owner_when_starttime_unreadable(self):
+        # 只有半个身份（pid 有、指纹没有）等于没有身份：落盘时必须整体缺省，
+        # 否则「进程还在、指纹读不出来」会被误当成归属仍然有效
+        self._make_proc(100, 1, HERDR_ENV_VARS)
+        got = discover_herdr_env(proc_root=self.proc, start_pid=100)
+        self.assertIsNotNone(got)
+        self.assertNotIn(OWNER_PID, got)
+        self.assertNotIn(OWNER_START, got)
 
 
 if __name__ == "__main__":

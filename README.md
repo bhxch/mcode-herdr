@@ -1,70 +1,218 @@
 # mcode-herdr
 
-mcode 的**本地插件**：把 mcode 会话的 agent 状态与会话恢复命令上报给 herdr，
-让 mcode 在 herdr 侧边栏、`herdr agent list`、`herdr agent wait` / `herdr agent prompt`
-里成为一个一等 agent，而不是一个 herdr 完全看不见的进程。
+**让 herdr 看见 mcode。**
 
-- 实现：Python 3 标准库（无第三方依赖）+ POSIX shell 安装脚本
-- 平台：**仅 Linux**（原因见 [已知限制](#7-已知限制)）
-- 版本基线：mcode 0.6.3、herdr 0.9.3、Python 3.14（本机实测）
+herdr 的 agent 识别是一份编译在二进制里的白名单，里面没有 mcode。装这个插件之前，
+herdr 对 mcode 是**完全盲的**：
+
+```console
+$ herdr agent list
+{"id":"cli:agent:list","result":{"agents":[],"type":"agent_list"}}
+```
+
+- 侧边栏没有条目，mcode 跑完一轮或卡住等你决策时都不会通知你
+- `herdr agent wait` / `herdr agent prompt` 这类自动化等不到、也够不着 mcode
+- herdr server 重启后，pane 里正跑着的 mcode 会话拉不回来
+
+herdr 二进制改不了（agent kind 列表编译在里面），所以走 herdr 官方文档
+《Add Herdr support to your agent》给的路子：**由 agent 自行上报**。本插件就是那个上报方。
+装上之后：
+
+| | 装之前 | 装之后 |
+| --- | --- | --- |
+| `herdr agent list` | 空 | 有 `mcode` 行，状态 `idle` / `working` / `blocked` |
+| 侧边栏 | 无条目 | 有条目；卡住等你决策时通知你 |
+| `herdr agent wait` / `prompt` | 等不到 | 可以用来做自动化 |
+| herdr server 重启后 | 会话无法拉回 | 恢复命令 `mcode --session <id>` |
+
+- 实现：Python 3 标准库（**无第三方依赖**）+ POSIX shell 安装脚本
+- 平台：**仅 Linux**（原因见[已知限制](#9-已知限制)）
+- 版本基线：mcode 0.6.3、herdr 0.9.3、Python 3.14.7（本机实测）
 
 ---
 
-## 1. 它解决什么问题
+## 1. 环境要求
 
-herdr 的 agent 识别是编译在二进制里的：`src/agent_resume.rs` 的
-`is_official_agent_source` 是一份 17 对 `(source, agent)` 的硬编码白名单，不含 mcode；
-herdr 也没有针对 mcode 的屏幕检测规则。**所以在装这个插件之前，herdr 对 mcode 是完全盲的**：
+| 要求 | 版本 | 不满足会怎样 |
+| --- | --- | --- |
+| 操作系统 | Linux | 插件退化为彻底无操作，见[§9.1](#91-仅-linux) |
+| mcode | 0.6.3（开发于该版本） | 钩子事件名/载荷字段变化会失配 |
+| herdr | 0.9.3 | 上报协议随版本变 |
+| Python 3 | 3.14（本机 3.14.7） | 标准库即可，不需要 pip 装任何东西 |
+| mcode 运行时 | 会话必须跑在 herdr pane 里 | 不在 herdr 里，插件按设计完全静默 |
 
-- `herdr agent list` 里没有 mcode —— 本机实测返回 `{"agents":[],"type":"agent_list"}`
-- 侧边栏没有条目，mcode 跑完一轮或卡住等你决策时不会通知你
-- `herdr agent wait` / `herdr agent prompt` 之类的自动化等不到、够不着 mcode
-- herdr server 重启后，pane 里跑着的 mcode 会话无法被拉回来
-
-herdr 不能改（agent kind 列表编译在二进制里），所以走的是 herdr 官方文档
-《Add Herdr support to your agent》给的路子：**由 agent 自行上报**。
-本插件就是那个上报方。装上之后，一个 mcode 会话在 herdr 侧的状态是
-`idle` / `working` / `blocked`，其恢复命令是 `mcode --session <id>`。
-
----
-
-## 2. 安装与卸载
-
-### 安装
+先确认 mcode 的会话确实跑在 herdr 里：
 
 ```bash
+echo "$HERDR_ENV"    # 期望输出 1
+```
+
+---
+
+## 2. 安装
+
+```bash
+git clone https://github.com/<owner>/mcode-herdr.git mcode-herdr
+cd mcode-herdr
 ./install.sh
 ```
 
-`install.sh` 做四件事：
+（`<owner>` 换成实际仓库归属。）
 
-1. 把 `plugin/` 整目录同步到 `$MINIMAX_DATA_DIR/plugins/mcode-herdr/`
-   （默认 `~/.minimax/plugins/mcode-herdr`）；先 `rm -rf` 旧目录再复制，并清掉 `__pycache__`
+`install.sh` 做五件事：
+
+1. 把 `plugin/` 整目录**复制**（不是链接）到 `$MINIMAX_DATA_DIR/plugins/mcode-herdr/`
+   （默认 `~/.minimax/plugins/mcode-herdr`）；先 `rm -rf` 旧目录再复制，
+   并清掉 `__pycache__`、给 `scripts/*.py` 补上可执行位
 2. 用 `mcode plugin list -m local --available` 验证本地市场确实发现了它，
-   grep 不到就直接失败退出并提示检查 `icon` 字段
+   grep 不到就**直接失败退出**并提示检查 `icon` 字段
 3. 检查恢复命令 `mcode` 能否被 herdr 执行：先看**当前环境**的 PATH，
-   再看 **herdr server 进程**的 PATH（那才是真正执行恢复命令的环境）；
-   两处都找不到才打印警告
-   （见 [第 5 节](#5-恢复命令依赖-mcode-在-path-上)）
-4. 提示你重启 mcode
+   再看 **herdr server 进程**的 PATH（那才是真正执行恢复命令的环境）；两处都找不到才警告，
+   见[§7](#7-恢复命令依赖-mcode-在-herdr-server-的-path-上)
+4. 删不掉东西时拒绝执行（`DEST` 必须是绝对路径且末段恰好是 `mcode-herdr`）
+5. 提示你重启 mcode
 
-几点需要知道的：
+用非默认 profile（换整个 data dir）：
 
-- **不需要 `mcode plugin add`。** 本地插件只要躺在 `~/.minimax/plugins/<name>/` 下，
-  被扫描到就已经是 installed + enabled（mcode CLI 显式拒绝本地插件的 install 操作，
-  `plugin add` 是 Desktop 的功能）。`install.sh` 只是同步 + 验证。
-- **用的是复制而不是符号链接**，因为本地市场扫描器不跟随符号链接。
-  代价：改完代码要重跑 `./install.sh` 才生效。
-- 非默认 profile 用 `MINIMAX_DATA_DIR` 覆盖：
+```bash
+MINIMAX_DATA_DIR=/path/to/other-profile ./install.sh
+```
 
-  ```bash
-  MINIMAX_DATA_DIR=/path/to/other-profile ./install.sh
-  ```
+> `install.sh` 与 `uninstall.sh` 只认 `MINIMAX_DATA_DIR`，其次退到 `~/.minimax`。
+> mcode 自己还会再退一档到 `MAVIS_DATA_DIR`（`packages/tui/src/runtime/data-dir.ts:8,27-37`）。
+> 只设 `MAVIS_DATA_DIR` 而不设 `MINIMAX_DATA_DIR` 时，两个脚本会装到默认 profile 去 ——
+> 要么两个都设，要么把 `MINIMAX_DATA_DIR` 也导出来。
 
-- **装完必须重启 mcode 或开一个新会话才生效**（`install.sh` 最后一行也是这么提示的）：
-  已运行的会话不会补挂钩子。
+> **装完必须重启 mcode 或开一个新会话才生效**（`install.sh` 最后一行也是这么提示的）：
+> 已经跑着的会话不会补挂钩子。
 
-### 卸载
+### 2.1 怎么确认装对了
+
+```bash
+# 1) 本地市场已经发现了它
+mcode plugin list -m local --available
+```
+
+输出里要有一行含 `[*]` 和 `mcode-herdr@local`。`--json` 形式下，文档里的
+mcode-herdr 条目形如（实测）：
+
+```json
+{"name": "mcode-herdr", "installed": true, "enabled": true, "version": "0.1.0"}
+```
+
+**`installed` 与 `enabled` 都不需要你去做什么操作**——本地插件被发现即视为已安装已启用，
+原因见[§2.2.2](#222-不要跑-mcode-plugin-add)。
+
+```bash
+# 2) 在 herdr pane 里重启 mcode，跑一轮（随便发一条提示），然后：
+herdr agent list
+```
+
+出现 `mcode` 行、状态随你的操作在 `idle` / `working` / `blocked` 之间流转，就是装好了。
+还是空的话直接看[§8 排障](#8-排障)。
+
+### 2.2 三个静默失败陷阱
+
+**下面三种装法不会报错，只会让你装了个寂寞。** 本节是全文最该先读的部分。
+
+| # | 别这么做 | 实测结果 | 正确做法 |
+| --- | --- | --- | --- |
+| 1 | `ln -s <repo>/plugin ~/.minimax/plugins/mcode-herdr` | `mcode plugin list -m local --available` 返回**空**，一个字都不提示 | **复制**。`./install.sh` 就是复制；改完代码重跑它 |
+| 2 | `mcode plugin add -m local mcode-herdr` | 报 `LOCAL_PLUGIN_INSTALL_UNSUPPORTED`，直接失败 | **不要跑**。被发现即 installed + enabled |
+| 3 | 复制到 `~/.minimax/plugins/wrapper/plugin/...`（多套一层目录） | 扫描不到，**无任何诊断** | 插件目录必须**直接**含一份清单文件 |
+
+#### 2.2.1 符号链接会被静默忽略（最常见的失败方式）
+
+把 clone 下来的仓库用软链指过去，是「让插件跟着仓库一起更新」的最顺手做法。
+**它不工作，而且没有任何地方会告诉你。**
+
+- 本地市场扫描器直接跳过符号链接子项（`plugin/package/package-readers.ts:107,111`），
+  规范化插件根目录时明确以 `rejectSymlink: true` 调用
+- 实测把本仓库的 `plugin/` 软链进 `plugins/mcode-herdr` 后，`mcode plugin list`
+  **整列为空**，退出码正常，无 stderr
+- 卸载时这种根目录还会被拒绝删除（`LOCAL_DELETE_UNSAFE`）
+
+所以更新代码的唯一方式是重跑 `./install.sh`（先删旧目录再复制，不留陈旧文件）。
+
+#### 2.2.2 不要跑 `mcode plugin add`
+
+**对本地插件，`install` 是硬编码不支持的**（`desktop-facade.ts:359-365` 直接抛异常），
+实测 CLI 报 `LOCAL_PLUGIN_INSTALL_UNSUPPORTED`。
+`enable` / `disable` / `remove` 对本地插件是可用的，只有 `install` 不行。
+
+本地插件**根本没有安装记录**。唯一的本地持久化是一份禁用名单：
+`isLocalPluginEnabled()` 判 `row === undefined` 就算启用
+（`plugin/runtime/repository.ts:181-189`）—— 没人禁用过就是启用的；
+`listInstalledPlugins` 的本地条目完全由目录扫描推出，
+本地市场的投影把 `installExists` 硬编码为 `true`（`desktop-facade.ts:630`）。
+换句话说，**插件躺在目录里就是装好了**，跑 `plugin add` 只会让你以为装失败了。
+
+#### 2.2.3 目录层级差一层就没了
+
+一个目录要算插件，必须**直接**包含下面某一份清单文件：
+
+```text
+.minimax-plugin/plugin.json   ← 本插件用的就是这个
+claude-plugin/plugin.json
+.codex-plugin/plugin.json
+```
+
+它们的优先级从左到右；另外，在插件根部直接放一个 `plugin.json` 也算
+（`plugin/package/package-readers.ts:146-162`）。
+
+复制到 `plugins/wrapper/plugin/...` 这种多一层的地方，**实测**扫描结果就是「什么都没有」：
+**没有任何诊断信息**，只有空列表。
+
+### 2.3 关于「本地市场」本身
+
+mcode 的插件市场只有两个源，都是硬编码的：
+
+```text
+official    registry
+local       directory    <dataDir>/plugins      # 默认 ~/.minimax/plugins
+```
+
+- `mcode plugin marketplace` **只有 `list` 和 `upgrade`，没有 add**。
+  也就是说，**没有「从 GitHub 加一个市场」这条路**
+- 本地市场的位置是单一固定路径 `<dataDir>/plugins`，
+  唯一能改的是**整体换 data dir**：`MINIMAX_DATA_DIR`（其次 `MAVIS_DATA_DIR`）
+- 顺带一提：mcode 源码里确实有一个能 `git clone` / 下载 GitHub codeload 归档的导入器
+  （`plugin/import/github-plugin-importer.ts`，落地见 `plugin-system.ts:545-548`、
+  `package-storage.ts:508-544`），但它只挂在 Desktop facade 上
+  （`desktop-facade.ts:240-297`），`packages/tui/src/cli/plugin-command.ts` 从不引用它。
+  **CLI 里没有 `git+https://` 安装、没有 tarball URL 安装、没有对应 flag。**
+  别去找了。
+
+### 2.4 清单要求（顺手写插件时会踩）
+
+`plugin/.minimax-plugin/plugin.json`：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `schemaVersion` | ✅ | 必须严格等于 `1` |
+| `name` | ✅ | 插件名 |
+| `version` | ✅ | 严格 semver |
+| `description` / `author` / `category` | ✅ | |
+| `icon` | ✅ | **必填，且文件必须真实存在**。缺失 → 整包被静默跳过 |
+| `exampleQueries` | ✅ | 数组，可以是空的 |
+| `apps` / `mcpServers` / `skills` | ✅ | 数组，可以是空的 |
+| `displayName` / `darkIcon` / `hooks` / `hostBindings` | ➖ | 可选 |
+
+其他几条：
+
+- 清单**不能有未知的顶层字段**，多一个就判非法
+- 至少要声明一种可执行能力（`apps` / `mcpServers` / `skills` / `hooks` 之一），
+  否则清单读取失败 —— 本插件靠 `hooks` 满足
+- 清单按**拒绝 BOM 的 UTF-8** 读取
+- 带 `hooks` 的插件会被复制进 `<dataDir>/v2/plugin-hook-cache` 下的
+  只读内容寻址缓存
+
+缺 `icon` 是最经典的一种失败：官方插件全都带 `icon`，所以缺字段的本地包看起来就像
+「整个市场失效了」。详见[§8.1](#81-mcode-plugin-list--m-local---available-什么都看不到)。
+
+---
+
+## 3. 卸载
 
 ```bash
 ./uninstall.sh
@@ -72,31 +220,36 @@ herdr 不能改（agent kind 列表编译在二进制里），所以走的是 he
 
 它先对**当前所在 pane** 执行 `herdr pane release-agent`（否则 herdr 会继续把这个 pane
 显示为有 agent），再删掉安装目录。其他 pane 里的残留占用要自己
-`herdr pane release-agent <pane>` 清理。
+`herdr pane release-agent <PANE_ID> --source mcode-herdr --agent mcode --seq <N>` 清理。
 
-注意卸载**不删**插件数据目录下的状态文件，原因见 [第 7 节第 2 条](#72-异常退出后残留的-working)。
+release 的 `seq` 取自 `/proc/uptime` 换算，而不是 `date +%s`。原因见
+[§9.5](#95-uninstallsh-的-release-seq-取自-procuptime)—— 这条约束对任何新增的
+release 调用都成立。
+
+注意卸载**不删**插件数据目录下的状态文件，原因见[§9.2](#92-异常退出后残留的-working)。
 
 ---
 
-## 3. 工作原理
+## 4. 工作原理
 
-```
+```text
 mcode 生命周期钩子（6 个）
   │  argv[1] = 事件名，stdin = 载荷 JSON
   ▼
-plugin/scripts/herdr-report.py ── 读 stdin → Popen(start_new_session=True) ──► worker.py（后台）
+plugin/scripts/herdr-report.py ── 读 stdin → 回溯 HERDR_* → Popen(start_new_session=True) ──► worker.py（后台）
                                                                           │
                                                                           ▼
                                                           runtime.run_once()
-                            env 找回 → payload 解析 → store.update(decide) → transport 上报
+                            env 取用 → payload 解析 → store.update(decide) → transport 上报
                                                                           │
                                                     Unix socket（优先） / herdr CLI（回落）
 ```
 
-### 3.1 模块对照表
+### 4.1 模块对照表
 
 | 文件 | 职责 |
 | --- | --- |
+| `plugin/.minimax-plugin/plugin.json` | 插件清单 |
 | `plugin/hooks/hooks.json` | 6 个 mcode 事件 → `scripts/herdr-report.py <event>` 的映射 |
 | `plugin/scripts/herdr-report.py` | 钩子入口：读 stdin、**先回溯出 herdr 环境**、派生后台进程并把环境传给它、**不等**、立刻返回 |
 | `plugin/scripts/worker.py` | 后台 worker，调 `runtime.main()` |
@@ -108,7 +261,7 @@ plugin/scripts/herdr-report.py ── 读 stdin → Popen(start_new_session=True
 | `plugin/scripts/mcode_herdr/herdr.py` | 协议常量与标签：`source="mcode-herdr"`、`agent="mcode"` |
 | `plugin/scripts/mcode_herdr/runtime.py` | 把上面这些串成一次完整上报 |
 
-### 3.2 六个钩子，工具钩子只挂 `ask_user`
+### 4.2 六个钩子，工具钩子只挂 `ask_user`
 
 `plugin/hooks/hooks.json` 注册了 6 个事件，每个都是
 `python3 "${PLUGIN_ROOT}/scripts/herdr-report.py" <event>`，`timeout: 5`：
@@ -132,58 +285,61 @@ plugin/scripts/herdr-report.py ── 读 stdin → Popen(start_new_session=True
 这条限制是有意为之：不给工具钩子加 matcher 的话，**每一次工具调用都会 fork 一个进程**。
 加上之后，钩子只在真正需要上报 `blocked` 时才触发。
 
-### 3.3 入口立即返回，上报交给脱离进程组的后台进程
+### 4.3 入口立即返回，上报交给脱离进程组的后台进程
 
 `herdr-report.py` 只做四件事：读掉 stdin、**先把 herdr 环境回溯出来**、
 `Popen` 派生 `worker.py`（`start_new_session=True`，stdout/stderr 接 `DEVNULL`）、
 把载荷写进子进程 stdin，然后**直接返回，不 wait**。`herdr-report.py:60` 还特意给
 `Popen` 填上 `returncode`，避免 GC 时 `__del__` 发 `ResourceWarning` 污染 stderr。
 
-**耗时**：本机实测钩子入口 **0.048 ~ 0.051 秒**返回（11 次连续采样，Python 3.14.7）。
-测量方法：用一个临时目录里的假 herdr 二进制 + 临时 `PLUGIN_DATA`，让钩子进程**自身
-环境不含 `HERDR_*`**、假 `HERDR_*` 放在它的直接父进程上 —— 这正是生产形态
-（mcode 给钩子白名单环境，`HERDR_*` 只在祖先进程上），这样既覆盖了 `/proc` 回溯这条路，
-又保证任何上报都不会落到真实 herdr 上。计时器括住的是「父进程 → 钩子 → 返回」整段。
-同一台机器上另一次在更繁忙的时段量到 0.068 ~ 0.182 秒，所以**这个数字只能当量级看**，
-随机器负载浮动。参考量：`python3 -c pass` 本身约 0.010 秒，即钩子入口约为解释器冷启动的 5 倍。
-上报在后台完成，与这个数字无关。`test/test_replay.py` 的断言阈值取 1.0 秒（留了 20 倍余量）。
+**耗时**：钩子入口约 0.05s 返回，上报在后台完成，与这个数字无关。
+量法与量级见[§6 性能](#6-性能)。
 
 钩子挂在内联路径上，**一个字节都不能往 stdout/stderr 写** —— `PreToolUse` 的输出会被
 mcode 运行时消费，污染可能改变工具执行结果。回放测试对此有硬断言
 （`assertEqual(proc.stdout, "")`）。
 
-### 3.4 找回 `HERDR_*`：`/proc` 父进程链回溯
+### 4.4 找回 `HERDR_*`：`/proc` 父进程链回溯，以及一个必须知道的 fork 陷阱
 
 这是整个插件最硬的一个约束。mcode 派发钩子子进程时给的是一个**按名字逐个挑出来的
 白名单环境**，只含：
 
-```
+```text
 PATH HOME LANG TERM SHELL USER TMPDIR TEMP TMP PATHEXT
 SystemRoot ComSpec USERPROFILE HOMEDRIVE HOMEPATH APPDATA LOCALAPPDATA
 ```
 
-**`HERDR_*` 一个都不传**（设计文档 §2.7 的探针实测：钩子里这些变量全空）。
-
-所以 `env.py` 只能自己去找：从自己的 pid 出发，沿 `/proc/<pid>/status` 的 `PPid:`
-逐级向上（最多 12 级），找到第一个满足 `HERDR_ENV=1` 且 `HERDR_PANE_ID`、
-`HERDR_BIN_PATH` 都非空的祖先 —— 那个进程就是 herdr 拉起的 mcode，它的
-`/proc/<pid>/environ` 里有全套 `HERDR_*`。
+**`HERDR_*` 一个都不传**（探针实测：钩子里这些变量全空）。所以 `env.py` 只能自己去找：
+从自己的 pid 出发，沿 `/proc/<pid>/status` 的 `PPid:` 逐级向上（最多 12 级），
+找到第一个满足 `HERDR_ENV=1` 且 `HERDR_PANE_ID`、`HERDR_BIN_PATH` 都非空的祖先 ——
+那个进程就是 herdr 拉起的 mcode，它的 `/proc/<pid>/environ` 里有全套 `HERDR_*`。
 
 父进程号必须读 `status` 里的 `PPid:`，不能按位置解析 `/proc/<pid>/stat` ——
 `comm` 含空格或括号会直接错位（探针第一版就踩了这个坑，只回溯到 depth=0）。
 
-**这条回溯必须由钩子进程自己完成，并在派生 worker 之前做完。** 后台 worker 一脱离，
-父进程就退出、worker 被 init 收养（`start_new_session` 只换会话组，不改父子关系），
-`/proc` 父链随之断在 `pid<=1` 的守卫上，worker 自己的回溯恒返回 `None`。这个坑踩过：
-真机上量到 `worker MY_PPID = 1`、钩子照常触发、状态文件一个都不写、
-`herdr agent list` 永远是空的。所以 `herdr-report.py` 在**父进程里**就把结果取出来，
-连同 `child_env` 一起用 `env=` 交给 worker；解析不到（不在 herdr 里）时连 worker 都不派生。
+> **要 fork 这套设计的话，这是那个坑**：环境回溯**必须由钩子进程自己做，
+> 并且必须在派生 worker 之前做完**。worker 一脱离，父进程就退出、worker 被 init 收养
+> （`start_new_session` 只换会话组，不改父子关系），`/proc` 父链随之断在 `pid<=1` 的守卫上，
+> worker 自己的回溯恒返回 `None`。
+>
+> 这个坑踩过：真机上量到 `worker MY_PPID = 1`、环境发现返回 `None`、钩子照常触发、
+> **状态文件一个都不写**、`herdr agent list` 永远是空的。
+>
+> 所以 `herdr-report.py` 在父进程里就把结果取出来，连同 `child_env` 一起用 `env=` 交给 worker；
+> 解析不到（不在 herdr 里）时连 worker 都不派生。
 
-`runtime._resolve_herdr_env` 因此有两级：先采信子进程环境里**显式存在**的 `HERDR_*`
-（生产主路径就是它 —— 上面 `herdr-report.py` 注入的；在 herdr pane 里手工跑 `worker.py`
-也走这条），没有才回退到 `/proc` 回溯（回放测试注入假环境、或手工在 mcode 进程树里跑时命中）。
+于是 `runtime._resolve_herdr_env` 有两级：
 
-### 3.5 状态：每个 pane 一个 JSON
+1. **先采信子进程环境里显式存在的 `HERDR_*`** —— 这是生产主路径。
+   注意这里的「显式」**不是 mcode 传了 `HERDR_*`**，而是上一段里钩子入口自己回溯出来、
+   用 `env=` 注入进去的。它同时覆盖「人在 herdr pane 里手工跑 `worker.py`」
+   （这时你自己的 shell 里就有 `HERDR_*`）和回放测试注入假环境两种情况
+2. **没有才回退到 `/proc` 回溯** —— 只在既没有显式 `HERDR_*`、
+   又确实还在 mcode 进程树里时才命中
+
+删掉第一条分支，整个插件会静默失效（`herdr agent list` 永远为空）。
+
+### 4.5 状态：每个 pane 一个 JSON
 
 `store.py` 在 mcode 注入的 `PLUGIN_DATA` 目录里，为每个 pane 存一个 JSON：
 
@@ -195,17 +351,17 @@ SystemRoot ComSpec USERPROFILE HOMEDRIVE HOMEPATH APPDATA LOCALAPPDATA
   例如 pane `w4:p3` → `w4_p3.json`，同目录还有一个 `w4_p3.lock`（flock 锁文件）
 - **并发安全**：所有读改写都在 `Store.update()` 的**单次持锁**内完成。
   注意 `load()`/`save()` 各自加锁，但两者合起来不是一个临界区 —— 需要
-  「读最新值 → 决定 → 写回」整体原子时必须用 `update()`（其回调不可重入同一 pane 的 store）
+  「读最新值 → 决定 → 写回」整体原子时必须用 `update()`
 - **不撕裂**：写入走临时文件 + `os.replace()` 原子替换，读者永远看到完整 JSON。
   文件权限 `0600`：状态里是要拼进 `mcode --session <id>` 的会话标识，不该同机可读
 - **不用 `/tmp` 兜底**：拿不到 `PLUGIN_DATA` 就直接什么都不做。状态文件名由 pane id 派生、
   可预测，而临时文件用的是 `os.open(O_CREAT)`，它会跟随预置的符号链接 ——
   在全局可写的 `/tmp` 里等于把状态 JSON 写进攻击者指定的文件
 
-### 3.6 状态机：只在状态变化时上报
+### 4.6 状态机：只在状态变化时上报
 
 `decide.py` 是纯函数，签名 `decide(action, payload, state) -> Decision | None`，
-输入是（事件、载荷、上次状态），输出是「报不报、报什么」。规则：
+输入是（事件、载荷、上次状态），输出是「报不报、报什么」：
 
 | 动作 | 条件 | 结果 |
 | --- | --- | --- |
@@ -234,15 +390,18 @@ SystemRoot ComSpec USERPROFILE HOMEDRIVE HOMEPATH APPDATA LOCALAPPDATA
   `UserPromptSubmit`（实测那一轮在上一轮 `Stop` 之后约 27s），由 `user-prompt` 分支解开。
 
 按错误语义实现时，真实 herdr 上量到 `blocked` 只存活 **121ms** 就被 `working`、
-再被 `done` 覆盖掉；按上表实现后实测是
-`+0ms idle | +2s working | +4s blocked ... held 15.8s ... +18s working | +19s done`。
+再被 `done` 覆盖掉；按上表实现后实测：
+
+```text
++0ms idle | +2s working | +4s blocked ... held 15.8s ... +18s working | +19s done
+```
 
 **与上次相同的状态不上报**（`last_reported` 去重），因为 herdr 自己的通知也是按状态跃迁
 派生并自带去重的，重复上报没有收益。这也是为什么恢复命令必须挂在 `session-start` 上 ——
 那是 pane 第一次学到本次会话 id 的时刻，也是唯一能拿到恢复命令去 attach 的时刻
 （herdr 会拒绝后到的恢复命令，`resume_not_accepted`）。
 
-### 3.7 双通道上报与「宁可漏报不可误报」
+### 4.7 双通道上报与「宁可漏报不可误报」
 
 `transport.py` 先试 Unix socket（`HERDR_SOCKET_PATH`，方法
 `pane.report_agent` / `pane.release_agent`，超时 0.5s），失败回落
@@ -251,12 +410,13 @@ SystemRoot ComSpec USERPROFILE HOMEDRIVE HOMEPATH APPDATA LOCALAPPDATA
 两个容易踩的点，实现里都刻意做了防护：
 
 - **`seq` 必须严格递增。** herdr 按 **source** 维护一个 seq 高水位
-  （`src/terminal/state.rs:1965` 的 `hook_report_is_newer`：要求 `seq > 上次`，且一旦用过 seq，
-  之后不带 seq 的上报会被直接拒掉），不满足就**静默丢弃**该次上报，**包括 release**。
-  所以每次上报（含 release）都带 `seq`，取自 `time.monotonic_ns()` —— 必须用单调时钟：
-  `CLOCK_REALTIME` 会被 NTP 回步或校时打回。危险之处在于 **herdr 丢弃过期上报时照样回 `ok`**
-  （`src/app/api/panes.rs:1678-1679`：一旦 `applied` 为假就剥掉 `resume_argv` 走成功分支），
-  调用方无从察觉，却已经记下了状态 —— 于是状态机会把同一事件永久去重，pane 再无恢复触发地发散。
+  （`src/terminal/state.rs:1965` 的 `hook_report_is_newer`：要求 `seq > 上次`，
+  且一旦用过 seq，之后不带 seq 的上报会被直接拒掉），不满足就**静默丢弃**该次上报，
+  **包括 release**。所以每次上报（含 release）都带 `seq`，取自 `time.monotonic_ns()` ——
+  必须用单调时钟：`CLOCK_REALTIME` 会被 NTP 回步或校时打回。危险之处在于
+  **herdr 丢弃过期上报时照样回 `ok`**（`src/app/api/panes.rs:1678-1679`：
+  一旦 `applied` 为假就剥掉 `resume_argv` 走成功分支），调用方无从察觉，却已经记下了状态 ——
+  于是状态机会把同一事件永久去重，pane 再无恢复触发地发散。
 - **误报比漏报危险得多。** 漏报只是多等一次重试；误报会让调用方记下一个 herdr
   根本没收到的状态，而状态机按 `last_reported` 去重会把后续重试全压掉 —— 同样是无声发散。
   所以只有**结构完整的 herdr 成功应答**（是 dict、含 `result`、不含 `error`）
@@ -266,7 +426,7 @@ SystemRoot ComSpec USERPROFILE HOMEDRIVE HOMEPATH APPDATA LOCALAPPDATA
 恢复命令是增强能力、状态转移才是主功能，所以 `resume_argv` 校验失败时
 **降级为不带恢复命令继续上报**，而不是把这次状态上报一起赔掉。
 
-### 3.8 彻底静默
+### 4.8 彻底静默
 
 「不在 herdr 里就完全消失」是硬要求，`runtime.run_once()` 里对应三个提前返回：
 不在 herdr（`env` 找不到）、载荷不是合法 JSON、拿不到 `PLUGIN_DATA`。
@@ -275,7 +435,7 @@ SystemRoot ComSpec USERPROFILE HOMEDRIVE HOMEPATH APPDATA LOCALAPPDATA
 
 ---
 
-## 4. 子代理语义：为什么 `blocked` 是例外
+## 5. 子代理语义：为什么 `blocked` 是例外
 
 mcode 给每个子代理**独立的 `session_id`**。所以「`session_id != root_session`」
 就是一个可靠、且与字段命名无关的子代理判据。`decide.py` 据此做了三处过滤：
@@ -300,7 +460,7 @@ mcode 给每个子代理**独立的 `session_id`**。所以「`session_id != roo
 **关于这个例外，有一条真机结论要讲清楚**（mcode 0.6.3）：**子代理根本没有 `ask_user`
 这个工具**。真机分别派了 `explore` 与 `mavis` 两种子代理去尝试提问，两者独立报告
 调不到、只有顶层 agent 能调（`explore` 报出自己的工具是 bash / glob / grep / read /
-web_fetch）。所以上面这条例外分支在当前版本是**前瞻性防御**，不是可达路径 ——
+`web_fetch`）。所以上面这条例外分支在当前版本是**前瞻性防御，不是可达路径** ——
 回放测试里那条用例是用构造载荷覆盖的。
 
 子代理的 `session_id` 管道仍然保留：mcode 某个版本真把 `ask_user` 暴露给子代理时，
@@ -309,7 +469,30 @@ web_fetch）。所以上面这条例外分支在当前版本是**前瞻性防御
 
 ---
 
-## 5. 恢复命令依赖 `mcode` 在 PATH 上
+## 6. 性能
+
+钩子入口（`herdr-report.py`）在 mcode 的工具调用关键路径上，所以它的耗时是要盯的数。
+
+| 测量 | 值 |
+| --- | --- |
+| 隔离 harness，11 次连续采样 | **0.048 ~ 0.051 s** |
+| 同一台机器，较繁忙时段 | 0.068 ~ 0.182 s |
+| 参照：`python3 -c pass` | ≈ 0.010 s |
+| `test/test_replay.py` 的断言阈值 | 1.0 s |
+
+**只当量级看，不要当 SLA**：数值随机器负载浮动。
+
+隔离 harness 的做法：临时目录里的假 herdr 二进制 + 临时 `PLUGIN_DATA`，
+让钩子进程**自身环境不含 `HERDR_*`**、把假 `HERDR_*` 放在它的直接父进程上 ——
+这正是生产形态（mcode 给钩子白名单环境，`HERDR_*` 只在祖先进程上）。这样既覆盖了
+`/proc` 回溯那条路，又保证任何上报都不会落到真实 herdr 上。计时器括住的是
+「父进程 → 钩子 → 返回」整段。
+
+真正的上报在脱离进程组的后台进程里完成，不占用这个时间。
+
+---
+
+## 7. 恢复命令依赖 `mcode` 在 herdr server 的 PATH 上
 
 会话恢复命令是 **`["mcode", "--session", session_id]`**（`runtime.py`），
 上报时作为 `resume_argv` 跟在 herdr 的 `--` 之后。
@@ -319,17 +502,22 @@ web_fetch）。所以上面这条例外分支在当前版本是**前瞻性防御
 `[A-Za-z0-9._-]` —— 绝对路径会被拒。另外还限制：≤64 个参数、总长 ≤8192 字节、
 不含控制字符、不含单引号。
 
-于是就有一个**很容易被忽略的约束**：如果 `mcode` 不在 **herdr server 的 PATH** 上，
-恢复会**静默失败**（面板状态照常上报，只有恢复不工作）。`install.sh` 会分两级检查：
-先看**当前环境**的 PATH 上有没有 `mcode`，没有再读 **herdr server 进程**的 PATH
-（`/proc/<pid>/environ`）——后者才是真正执行恢复命令的那份环境。
+于是就有一个**很容易被忽略的约束**：恢复命令是由 **herdr server 进程**去解析执行的，
+不是由你的当前 shell 解析。如果 `mcode` 不在 **herdr server 的 PATH** 上，
+恢复会**静默失败**（面板状态照常上报，只有恢复不工作）。
 
-（这里特意不用「登录 shell 的 PATH」：登录 shell 不读 `~/.bashrc`，而本机 mcode 的
-PATH 正是从 `~/.bashrc` 加的，用登录 shell 判断会每次都误报成「找不到 mcode」。）
+`install.sh` 分两级检查：先看**当前环境**的 PATH 上有没有 `mcode`，没有再读
+**herdr server 进程**的 PATH（`/proc/<pid>/environ`）—— 后者才是真正执行恢复命令的那份环境。
+
+> 这里特意**不用「登录 shell 的 PATH」**：`env -i /bin/sh -lc` 那种判断之所以不可用，
+> 是因为登录 shell 不读 `~/.bashrc`，而很多机器（这台也是）恰恰是把 mcode 的 PATH
+> 加在 `~/.bashrc` 里的 —— 于是无论 mcode 是否真的可用都会误报成「找不到」。
+> 读者自己排查时也容易在这里绕半天。
 
 ```bash
 ln -s "$(command -v mcode)" ~/.local/bin/mcode
 # 并确保 ~/.local/bin 在 herdr server 能看到的 PATH 里
+# 然后重启 herdr server，让它带上新的 PATH
 ```
 
 （顺带一提：这也是为什么源码里不传 `agent_session_path` —— 它和 `agent_session_id`
@@ -337,32 +525,38 @@ ln -s "$(command -v mcode)" ~/.local/bin/mcode
 
 ---
 
-## 6. 排障
+## 8. 排障
 
-### 6.1 `mcode plugin list -m local --available` 什么都看不到
+### 8.1 `mcode plugin list -m local --available` 什么都看不到
 
-**几乎总是因为 `plugin.json` 缺 `icon` 字段。** mcode 解析本地插件清单时**无条件**
-要求 `icon`，缺失即判定清单非法（`MANIFEST_SCHEMA_INVALID`）；而本地插件的扫描会把校验
-失败写进 `diagnostics` 后**静默跳过**，CLI 上没有任何提示（官方插件全都带 `icon`，
-所以缺字段的本地包看起来就像「市场整体失效」）。本项目自己就踩过这个坑。
+按可能性从高到低：
 
-`plugin/.minimax-plugin/plugin.json` 里必须有 `"icon": "icon.png"`，
-且 `plugin/icon.png` 真实存在（1×1 PNG）。另外 `exampleQueries` / `apps` /
-`mcpServers` / `skills` 四个数组**也都是必填**（`hooks` 才是可选的），
-缺任何一个的后果与缺 `icon` 一样：整包被静默跳过。
+1. **符号链接**。如果你自己动手装过，十有八九是用了 `ln -s`，扫描器直接跳过（见[§2.2](#22-三个静默失败陷阱)）
+2. **目录多套了一层**。插件目录必须**直接**含清单文件（见[§2.2](#22-三个静默失败陷阱)）
+3. **`plugin.json` 缺 `icon` 字段**。mcode 解析本地插件清单时**无条件**要求 `icon`，
+   缺失即判非法（`MANIFEST_SCHEMA_INVALID`）；而本地插件的扫描会把校验失败写进
+   `diagnostics` 后**静默跳过**，CLI 上没有任何提示。本项目自己就踩过这个坑
 
-### 6.2 herdr 里看不到 mcode agent
+   `plugin/.minimax-plugin/plugin.json` 里必须有 `"icon": "icon.png"`，
+   且 `plugin/icon.png` 真实存在（1×1 PNG）。另外 `exampleQueries` / `apps` /
+   `mcpServers` / `skills` 四个数组**也都是必填**（`hooks` 才是可选的），
+   缺任何一个的后果与缺 `icon` 一样：整包被静默跳过。完整清单见[§2.4](#24-清单要求顺手写插件时会踩)
+
+如果是用 `./install.sh` 装的，第 1、2 条已经排除了（脚本自己就是复制，
+且 grep 不到就退出）—— 那就查第 3 条。
+
+### 8.2 herdr 里看不到 mcode agent
 
 按顺序排：
 
 1. **确认会话真的跑在 herdr pane 里**：`echo $HERDR_ENV` 应该是 `1`。
    不在 herdr 里，插件是彻底静默的设计（这是有意的，不是 bug）
 2. **确认插件装了且启用了**：`mcode plugin list -m local --available`
-   里应能看到 `mcode-herdr@local  enabled`；装完要**重启 mcode / 开新会话**
-3. **确认 PATH**：见 [第 5 节](#5-恢复命令依赖-mcode-在-path-上)。
+   里应能看到 `mcode-herdr@local`；装完要**重启 mcode / 开新会话**
+3. **确认 PATH**：见[§7](#7-恢复命令依赖-mcode-在-herdr-server-的-path-上)。
    这一条只影响恢复，不影响状态显示
 
-### 6.3 怎么观察
+### 8.3 怎么观察
 
 ```bash
 herdr agent list                  # 列出 agent 及其状态
@@ -386,19 +580,19 @@ ls -l "${MINIMAX_DATA_DIR:-$HOME/.minimax}"/v2/plugin-data/hooks/mcode-herdr/
 cat "${MINIMAX_DATA_DIR:-$HOME/.minimax}"/v2/plugin-data/hooks/mcode-herdr/w4_p3.json
 ```
 
-`last_reported` 停在 `working` 而 mcode 其实早就退出了，就是下面第 7 节第 2 条说的那个坑。
+`last_reported` 停在 `working` 而 mcode 其实早就退出了，就是下面第 9.2 节说的那个坑。
 
-### 6.4 跑测试
+### 8.4 跑测试
 
 ```bash
 ./test/run-tests.sh
 ```
 
-离线回放，**完全不涉及 herdr 与 mcode**：喂真实的钩子载荷样本
+离线回放，**完全不涉及 herdr 与 mcode**，也不需要网络：喂真实的钩子载荷样本
 （`test/fixtures/`，每个样本的来源见 `test/fixtures/README.md`），用假 herdr 二进制
 逐条记录 argv / socket 请求，再断言调用序列与状态流转。当前 **102 个用例全绿**。
 样本里从未实时抓到的只有子代理工具事件（按 mcode 的字段契约构造），所以子代理路径的
-字段名变更风险未被真实抓包覆盖 —— 而且如第 4 节所述，mcode 0.6.3 的子代理根本调不到
+字段名变更风险未被真实抓包覆盖 —— 而且如第 5 节所述，mcode 0.6.3 的子代理根本调不到
 `ask_user`，这条路径当前连构造动机都有限。
 
 **验证状态说明**：本仓库自带的是离线回放测试。端到端（在真实 herdr pane 里跑 mcode、
@@ -407,15 +601,16 @@ cat "${MINIMAX_DATA_DIR:-$HOME/.minimax}"/v2/plugin-data/hooks/mcode-herdr/w4_p3
 
 ---
 
-## 7. 已知限制
+## 9. 已知限制
 
-### 1. 仅 Linux
+### 9.1 仅 Linux
 
-`/proc` 父进程链回溯是找回 `HERDR_*` 的唯一手段。在非 Linux 平台上插件取不到 pane 上下文，
+`/proc` 父进程链回溯是找回 `HERDR_*` 的唯一手段，状态文件的并发控制还依赖
+`fcntl.flock`。在非 Linux 平台上插件取不到 pane 上下文，
 按 herdr「不在 herdr 里就什么都不做」的约定**退化为彻底无操作** —— 这恰好是正确的降级行为，
 但也意味着在 macOS 上这个插件不提供任何功能。
 
-### 2. 异常退出后残留的 `working`
+### 9.2 异常退出后残留的 `working`
 
 如果 mcode 在一轮进行中被强杀（`kill -9`、终端被关、机器休眠唤醒后进程已死），
 `Stop` 永远不会到达，状态文件里的 `last_reported` 就永久停在 `working`。
@@ -429,7 +624,7 @@ cat "${MINIMAX_DATA_DIR:-$HOME/.minimax}"/v2/plugin-data/hooks/mcode-herdr/w4_p3
 
 - **换一个 herdr pane**。状态是按 pane id 存的，新 pane = 新文件，`last_reported` 为空，
   `SessionStart` 立刻被正常接受
-- **手动删掉那个 pane 的状态文件**（路径来源见 [6.3](#63-怎么观察)）：
+- **手动删掉那个 pane 的状态文件**（路径来源见[§8.3](#83-怎么观察)）：
 
   ```bash
   rm -f "${MINIMAX_DATA_DIR:-$HOME/.minimax}"/v2/plugin-data/hooks/mcode-herdr/w4_p3.json*
@@ -440,22 +635,22 @@ cat "${MINIMAX_DATA_DIR:-$HOME/.minimax}"/v2/plugin-data/hooks/mcode-herdr/w4_p3
   `<profile>/v2/plugin-data/hooks/mcode-herdr/` 在它之外，不会被清掉**。
   `./uninstall.sh` 同理。卸载重装也不会清。
 
-### 3. `agent_session_id` 会被 herdr 丢弃
+### 9.3 `agent_session_id` 会被 herdr 丢弃
 
 herdr 的 `session_ref_from_report` 先判 `is_official_agent_source`，
 而后者是 17 对硬编码的 `(source, agent)` 白名单（`src/agent_resume.rs:327`），不含 mcode。
 所以插件虽然照常上报了 `agent_session_id`，但对自定义 agent source 一律无效 ——
 **无害，但也没用**。会话恢复能力**完全依赖 `resume_argv`**，即
-[第 5 节](#5-恢复命令依赖-mcode-在-path-上) 那条命令。
+[§7](#7-恢复命令依赖-mcode-在-herdr-server-的-path-上) 那条命令。
 
-### 4. herdr 没有 `done` 这个上报状态
+### 9.4 herdr 没有 `done` 这个上报状态
 
 插件只会报 `idle` / `working` / `blocked`（herdr `report-agent --state` 的合法值就是
 `idle / working / blocked / unknown`）。**一轮做完就是报 `idle`**：
 herdr 自己会在显示层把「`idle` + 未被查看」渲染成 `done`
 （`src/app/agent_view.rs` 的 `status_name`）。这不影响 `herdr agent wait --until done`。
 
-### 5. `uninstall.sh` 的 release `seq` 取自 `/proc/uptime`
+### 9.5 `uninstall.sh` 的 release `seq` 取自 `/proc/uptime`
 
 herdr 丢弃 seq 不递增的上报，而插件用的是 `monotonic_ns()`（开机以来的纳秒）。
 如果 `uninstall.sh` 用 `date +%s`（纪元纳秒）来生成 release 的 seq，
@@ -464,11 +659,16 @@ monotonic seq 会被 herdr 判为过期而**全部静默丢弃**，插件看起�
 所以卸载脚本用 `/proc/uptime` 换算出同一时钟族的时间（读不到时才退回纪元值）。
 **维护提示：任何新增的 `release` 调用都必须遵守同一条约束。**
 
+### 9.6 子代理目前调不到 `ask_user`
+
+mcode 0.6.3 的 `explore` / `mavis` 两种子代理都没有 `ask_user` 工具（真机验证）。
+本插件的子代理 `blocked` 分支因此是前瞻性防御，当前不可达。见[§5](#5-子代理语义为什么-blocked-是例外)。
+
 ---
 
-## 8. 仓库结构
+## 10. 仓库结构
 
-```
+```text
 .
 ├── plugin/                        # 插件本体，安装时整体复制到 ~/.minimax/plugins/mcode-herdr/
 │   ├── .minimax-plugin/plugin.json
@@ -481,8 +681,21 @@ monotonic seq 会被 herdr 判为过期而**全部静默丢弃**，插件看起�
 ├── test/
 │   ├── run-tests.sh               # ./test/run-tests.sh
 │   ├── fixtures/*.json            # 真实载荷样本，来源见 fixtures/README.md
-│   ├── test_*.py
+│   └── test_*.py
+├── probe/                         # 一次性探针插件（herdr-probe）：把钩子收到的 stdin
+│   └── scripts/dump.sh            # 与 /proc 父链原样落盘。用来确定 mcode 的载荷字段名。
+│                                  # 不属于本插件，install.sh 不装它
 ├── install.sh
 ├── uninstall.sh
 └── docs/plans/                    # 设计文档与实现计划
+    ├── 2026-10-06-mcode-herdr-design.md
+    └── 2026-10-06-mcode-herdr-implementation-plan.md
 ```
+
+---
+
+## 11. 自己排查时的两个提醒
+
+1. **插件是彻底静默的**。任何一步出错都不重试、不报错、不写 stdout/stderr。
+   排查时不要指望日志 —— 唯一的可观测物是状态文件和 herdr 侧的 agent 状态
+2. **别顺手改 release 调用的 seq 来源**，见[§9.5](#95-uninstallsh-的-release-seq-取自-procuptime)

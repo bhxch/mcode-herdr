@@ -31,6 +31,11 @@ def main() -> int:
         # 它会被 init 收养，不会留下僵尸。
         proc.stdin.write(raw.encode())
         proc.stdin.close()
+        # Popen 对象此刻仍带着一个未回收的子进程：GC 触发 __del__ 时会发
+        # ResourceWarning，而它写的是 stderr —— 在 PYTHONWARNINGS=always 或
+        # python -X dev 下会污染钩子输出。填上 returncode 等于告诉 Popen
+        # 「已经收过了」，析构便不再告警，且完全不产生等待。
+        proc.returncode = 0
     except Exception:  # noqa: BLE001
         pass
     return 0

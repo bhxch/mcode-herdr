@@ -24,6 +24,9 @@ def _resume_argv(session_id: Optional[str]) -> list:
 
 
 def _resolve_herdr_env(env: Mapping[str, str], proc_root: Optional[Path]) -> Optional[Mapping[str, str]]:
+    # 第一条分支在生产环境不可达：mcode 的钩子环境是白名单拼的，里面没有 HERDR_*。
+    # 它是给「人在 herdr pane 里手动跑 worker.py」用的 —— 那种情况 os.environ 里本来就有
+    # HERDR_*，直接采信即可，不必再翻 /proc；回放测试也靠它注入假环境。删掉会让手动路径失灵。
     if env.get("HERDR_ENV") == "1" and env.get("HERDR_PANE_ID"):
         return {k: v for k, v in env.items() if k.startswith("HERDR_")}
     return discover_herdr_env(proc_root=proc_root or Path("/proc"))
@@ -40,7 +43,14 @@ def run_once(action: str, raw_payload: str, env: Mapping[str, str],
         return 0
 
     pane_id = herdr_env["HERDR_PANE_ID"]
-    store = Store(Path(env.get("PLUGIN_DATA") or "/tmp"))
+    # 拿不到 PLUGIN_DATA 就什么都不做，不回退到 /tmp：状态文件名由 pane id 派生、
+    # 可预测，而 store.py 落临时文件用的是 os.open(O_CREAT)，它会跟随预置的符号链接
+    # （0600 只管文件权限，管不了路径解析），在全局可写的 /tmp 里等于把状态 JSON
+    # 写进攻击者指定的文件。生产环境 mcode 必定注入 PLUGIN_*，回退分支本来就走不到。
+    plugin_data = env.get("PLUGIN_DATA")
+    if not plugin_data:
+        return 0
+    store = Store(Path(plugin_data))
 
     def step(state: PaneState) -> None:
         decision = decide(Action(action), payload, state)

@@ -66,8 +66,16 @@ class Store:
     def _write(self, path: Path, state: PaneState) -> None:
         """原子替换一个状态文件；调用方须已持锁。"""
         tmp = path.with_suffix(".json.tmp.%d" % os.getpid())
-        tmp.write_text(json.dumps(asdict(state)))
-        os.replace(tmp, path)
+        try:
+            # 不用 write_text：它按 umask 落成 0644，而状态里是要拼进
+            # `mcode --session <id>` 恢复命令的会话标识，不该同机可读。
+            fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                handle.write(json.dumps(asdict(state)))
+            os.replace(tmp, path)
+        finally:
+            # 成功时 tmp 已随 rename 消失，missing_ok 让这条清理不影响成功路径。
+            tmp.unlink(missing_ok=True)
 
     def load(self, pane_id: str) -> PaneState:
         with self._locked(pane_id) as path:

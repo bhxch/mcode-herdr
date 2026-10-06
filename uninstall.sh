@@ -2,7 +2,10 @@
 # 移除插件。先释放它对 pane 的占用，否则 herdr 会继续把 pane 显示为有 agent。
 set -euo pipefail
 
-DATA_DIR="${MINIMAX_DATA_DIR:-$HOME/.minimax}"
+# 与 install.sh 逐字对齐：数据目录解析顺序必须等同 mcode 自身（MINIMAX_DATA_DIR →
+# MAVIS_DATA_DIR → 默认值，见 packages/tui/src/runtime/data-dir.ts 的 readDataDirOverride）。
+# 两者一旦漂移，卸载指向的目录就和安装不是同一个：轻则留下插件，重则删掉别人的东西。
+DATA_DIR="${MINIMAX_DATA_DIR:-${MAVIS_DATA_DIR:-$HOME/.minimax}}"
 DEST="$DATA_DIR/plugins/mcode-herdr"
 
 if [ -n "${HERDR_BIN_PATH:-}" ] && [ -n "${HERDR_PANE_ID:-}" ]; then

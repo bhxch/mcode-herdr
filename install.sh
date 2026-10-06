@@ -3,7 +3,13 @@
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/plugin"
-DATA_DIR="${MINIMAX_DATA_DIR:-$HOME/.minimax}"
+# 数据目录必须与 mcode 自身的解析顺序逐层对齐：MINIMAX_DATA_DIR → MAVIS_DATA_DIR
+# → 默认值（见 packages/tui/src/runtime/data-dir.ts 的 readDataDirOverride）。
+# 漏掉中间一层，插件会装进用户根本没在运行的 profile，而下面的验证步骤同样跑在
+# 这个错误目录下，失败会被完全掩盖。本行必须与 uninstall.sh 逐字一致。
+# $HOME 保持裸展开：set -u 下 HOME 未设置时脚本直接中止，而空串会让 DEST 退化成
+# /plugins/mcode-herdr 并骗过下面的绝对路径检查。
+DATA_DIR="${MINIMAX_DATA_DIR:-${MAVIS_DATA_DIR:-$HOME/.minimax}}"
 DEST="$DATA_DIR/plugins/mcode-herdr"
 
 echo "==> 同步 $SRC -> $DEST"

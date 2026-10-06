@@ -188,3 +188,20 @@ class TransportTest(unittest.TestCase):
         finally:
             server.close()
         self.assertFalse(ok)
+
+    def test_socket_construction_failure_falls_back_to_cli(self):
+        # mcode 进程繁忙时可能 fd 耗尽，socket() 构造本身就抛 OSError；
+        # 它必须留在守卫区内，否则异常会逃出 report() 且 close 无从执行
+        real_socket = socket.socket
+
+        def no_fd(*args, **kwargs):
+            raise OSError(24, "Too many open files")
+
+        transport.socket.socket = no_fd  # 共享 stdlib 模块，用完必须还原
+        try:
+            ok = transport.report(self._env(HERDR_SOCKET_PATH=str(self.sock_path)),
+                                  state="idle", seq=17)
+        finally:
+            transport.socket.socket = real_socket
+        self.assertTrue(ok)  # 状态改由 CLI 通道发出去
+        self.assertEqual(len(self.calls), 1)

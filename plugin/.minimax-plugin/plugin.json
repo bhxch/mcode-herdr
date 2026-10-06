@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "name": "mcode-herdr",
+  "displayName": "mcode × herdr",
+  "version": "0.1.0",
+  "description": "把 mcode 的 agent 状态与会话恢复命令上报给 herdr，让 mcode 在 herdr 中可被识别、等待与恢复。",
+  "author": "mavis",
+  "icon": "icon.png",
+  "category": "Code",
+  "exampleQueries": [],
+  "apps": [],
+  "mcpServers": [],
+  "skills": [],
+  "hooks": ["hooks/hooks.json"]
+}

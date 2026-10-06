@@ -139,6 +139,16 @@ HERDR_WORKSPACE_ID / HERDR_SOCKET_PATH / HERDR_BIN_PATH` 全套。
 该方案是 Linux 专属。非 Linux 上取不到 pane 上下文，按 herdr 约定「不在 herdr 里就什么都不做」，
 退化为无操作即可——这恰好是正确的降级行为。
 
+### 2.8 实测确认：matcher 可按工具名过滤
+
+`runner.ts` 的 `matches()` 对 `PreToolUse`/`PostToolUse` 使用 `handler.matcher` 匹配工具名。
+实测：给两个工具钩子加 `"matcher": "ask_user"` 后，执行 `bash` 工具时
+两个钩子**完全不触发**（只捕获到 session-start / user-prompt / stop）。
+
+**这改变了设计取舍**：原方案担心 `PreToolUse` 挂在每次工具调用上、开销太大，
+改为「只为 `ask_user` 挂 matcher」后，钩子仅在真正需要上报 `blocked` 时才触发。
+fire-and-forget 仍然保留，但不再是高频路径。
+
 ## 3. 交付形态
 
 **mcode 本地插件**。不走 wrapper 脚本（拿不到 `blocked` 和可靠的 `session_id`），不改 bundle（升级即丢）。

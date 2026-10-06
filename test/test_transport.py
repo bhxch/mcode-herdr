@@ -125,6 +125,21 @@ class TransportTest(unittest.TestCase):
         self.assertIn("--", argv)
         self.assertEqual(argv[argv.index("--") + 1:], ["mcode", "--session", "abc"])
 
+    def test_invalid_resume_argv_still_reports_state(self):
+        # session_id 来自 hook JSON，带单引号时校验必然失败；herdr 也会拒收这个恢复命令，
+        # 所以要丢掉恢复命令但把状态发出去，而不是抛异常把状态上报一起丢掉
+        session_id = "abc'def"
+        ok = transport.report(self._env(), state="idle", seq=16,
+                              session_id=session_id,
+                              resume_argv=["mcode", "--session", session_id])
+        self.assertTrue(ok)
+        self.assertEqual(len(self.calls), 1)
+        argv = self.calls[0]
+        self.assertNotIn("--", argv)
+        # --session 只可能来自 resume_argv（--agent 的值恰好也是 "mcode"，不能拿它当判据）
+        self.assertNotIn("--session", argv)
+        self.assertIn(session_id, argv)  # 状态本身确实发出去了
+
     def test_all_channels_failing_returns_false_without_raising(self):
         def boom(argv, timeout):
             raise OSError("nope")

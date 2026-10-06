@@ -91,10 +91,19 @@ def report(env: Mapping[str, str], state: str, seq: int, *,
         params["message"] = message[:400]
     if session_id:
         params["agent_session_id"] = session_id
+    resume: Optional[list] = None
     if resume_argv:
-        validate_resume_argv(resume_argv)
-        params["resume_argv"] = list(resume_argv)
-        # 不传 agent_session_path：它与 session_ref 一样会被白名单挡掉，传了也是噪音
+        try:
+            validate_resume_argv(resume_argv)
+        except ValueError:
+            # 恢复命令校验失败说明 herdr 同样会拒收它，硬发只会白白丢掉这次上报；
+            # 恢复命令只是增强能力、状态转移才是主功能，所以降级为不带恢复命令继续上报，
+            # 而不是把 ValueError 抛出去把状态上报一起赔进去
+            pass
+        else:
+            resume = list(resume_argv)
+            params["resume_argv"] = resume
+            # 不传 agent_session_path：它与 session_ref 一样会被白名单挡掉，传了也是噪音
     if _socket_report(env, "pane.report_agent", params):
         return True
     argv = [env["HERDR_BIN_PATH"], "pane", "report-agent", env["HERDR_PANE_ID"],
@@ -104,8 +113,8 @@ def report(env: Mapping[str, str], state: str, seq: int, *,
         argv += ["--message", message[:400]]
     if session_id:
         argv += ["--agent-session-id", session_id]
-    if resume_argv:
-        argv += ["--"] + list(resume_argv)
+    if resume:
+        argv += ["--"] + resume
     try:
         return _run_cli(argv, herdr.CLI_TIMEOUT) == 0
     except (OSError, subprocess.SubprocessError):

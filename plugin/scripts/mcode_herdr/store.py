@@ -90,6 +90,9 @@ class Store:
 
         返回 fn 的返回值：决策通常在锁内基于最新状态算出，调用方要拿它去做
         上报，光拿写回后的状态不够。fn 抛异常时原样抛出且不落盘。
+
+        fn 不可重入：flock 绑在每次 open 的文件描述上，同一 pane 在 fn 里再
+        调本 store（load/update）会自死锁，并把该 pane 的锁永久泄漏给后续钩子。
         """
         with self._locked(pane_id) as path:
             state = self._read(path)

@@ -416,9 +416,15 @@ SystemRoot ComSpec USERPROFILE HOMEDRIVE HOMEPATH APPDATA LOCALAPPDATA
 `store.py` 在 mcode 注入的 `PLUGIN_DATA` 目录里，为每个 pane 存一个 JSON：
 
 ```json
-{"root_session": "mvs_...", "blocked_by": "mvs_...", "last_reported": "working"}
+{"root_session": "mvs_...", "blocked_by": "mvs_...", "last_reported": "working",
+ "owner_pid": "1528266", "owner_start": "73529166"}
 ```
 
+- **`owner_pid` / `owner_start`**：写下这份状态的 mcode 进程的 pid 与其启动时刻
+  （`/proc/<pid>/stat` 第 22 字段）。回溯 `HERDR_ENV` 命中的那个祖先进程就是 mcode
+  本身，pid 顺手就能拿到，不用额外开销。读状态时先核对归属进程是否还活着，不在就把
+  整份状态当作不存在 —— 这是「mcode 崩在 turn 中途 → pane 永久卡死」的修复，
+  见[§9.2](#92-异常退出后残留的-working)。pid 会被复用，所以必须连 `starttime` 一起比。
 - **文件名**：pane id 里所有非 `[A-Za-z0-9._-]` 的字符换成 `_`，再加 `.json`。
   例如 pane `w4:p3` → `w4_p3.json`，同目录还有一个 `w4_p3.lock`（flock 锁文件）
 - **并发安全**：所有读改写都在 `Store.update()` 的**单次持锁**内完成。
@@ -690,18 +696,24 @@ cat "${MINIMAX_DATA_DIR:-$HOME/.minimax}"/v2/plugin-data/hooks/mcode-herdr/w4_p3
 
 ### 9.2 异常退出后残留的 `working`
 
-如果 mcode 在一轮进行中被强杀（`kill -9`、终端被关、机器休眠唤醒后进程已死），
-`Stop` 永远不会到达，状态文件里的 `last_reported` 就永久停在 `working`。
+状态文件里除了 `root_session` / `blocked_by` / `last_reported`，还记着**归属它的
+mcode 进程**（`owner_pid` + `owner_start`，见[§4.5](#45-状态每个-pane-一个-json)）。因此如果 mcode 在一轮进行中被
+强杀（`kill -9`、终端被关、休眠唤醒后进程已死），`Stop` 永远不会到达，
+`last_reported` 会停在 `working` —— 但下一次读状态时插件会发现**归属进程已经不在了**
+（或 pid 还在、启动时间变了，说明是别的进程复用了这个 pid），于是把这份状态当作不存在，
+新的顶层会话的 `SessionStart` 会被正常接受。
 
-后果是连锁的：之后**任何**在该 pane 里开启的顶层会话，它的 `SessionStart`
-都会被「`working` ⇒ 必然是子代理」这条启发式吞掉（`decide.py`），
-于是它自己的 `root_session` 永远建立不起来，后续所有钩子对它也都不生效 ——
-**pane 看起来永久忙碌，而且没有任何东西会自己恢复它**。设计上没有 TTL 兜底。
+所以现在**不需要手工清理**：pane 会在下一个 mcode 会话启动时自动恢复。
 
-恢复办法：
+判据是归属进程的存活，而不是「`working` 这个值本身」。同一 pane 里 mcode 还活着时，
+`working` 仍然会让子代理的 `SessionStart` 被正确吞掉 —— 这条子代理抑制规则不受影响。
 
-- **换一个 herdr pane**。状态是按 pane id 存的，新 pane = 新文件，`last_reported` 为空，
-  `SessionStart` 立刻被正常接受
+状态文件里出现 `owner_pid: null`（老版本插件写的、或手工构造的）同样按「归属不明」处理，
+即视为过期。
+
+如果确实需要手工干预（例如归属进程还在但状态已错乱）：
+
+- **换一个 herdr pane**。状态按 pane id 存，新 pane = 新文件
 - **手动删掉那个 pane 的状态文件**（路径来源见[§8.3](#83-怎么观察)）：
 
   ```bash
@@ -712,6 +724,11 @@ cat "${MINIMAX_DATA_DIR:-$HOME/.minimax}"/v2/plugin-data/hooks/mcode-herdr/w4_p3
   `<profile>/plugins/mcode-herdr`（插件代码目录），**插件数据目录
   `<profile>/v2/plugin-data/hooks/mcode-herdr/` 在它之外，不会被清掉**。
   `./uninstall.sh` 同理。卸载重装也不会清。
+
+  重启 herdr server 也**不**保证清空：herdr 把 pane 编号持久化在
+  `<config>/session.json`（`public_pane_numbers` / `next_public_pane_number`），
+  恢复时从最大值继续发号，所以 pane id 不会重复、状态文件也就不会被自动作废。
+  归属检查才是让陈旧状态失效的机制。
 
 ### 9.3 `agent_session_id` 会被 herdr 丢弃
 

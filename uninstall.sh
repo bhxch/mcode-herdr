@@ -31,6 +31,18 @@ if [ -d "$DEST" ]; then
     echo "拒绝执行：DEST 末段不是 mcode-herdr：$DEST" >&2
     exit 1
   fi
+  # 先写一条本地禁用记录，再删目录。禁用记录是 mcode 里 local 插件唯一的持久状态
+  # （SQLite 的 local_runtime_plugin_local_disabled，按 canonical_root 键），写上它
+  # 之后，即使下面的 rm -rf 因为权限等原因没删干净，留在原地的插件也是禁用态，
+  # 不会继续在用户已经声明要卸载之后还上报状态。
+  # 同样的校验作用域要求：MINIMAX_DATA_DIR 是 mcode 解析链的最高优先级（data-dir.ts
+  # 的 readDataDirOverride），只给这一条命令设置它，脚本自身环境不变。
+  # mcode 不可用、插件未被列出等情况一律放过，卸载不能因此失败。
+  echo "==> 标记为禁用"
+  MINIMAX_DATA_DIR="$DATA_DIR" mcode plugin disable -m local mcode-herdr >/dev/null 2>&1 || true
+  # 注意：目录一旦删掉，mcode 会在下次扫描时自动清理这条孤立记录（源码里的
+  # pruneMissingLocalPlugins）。也就是说它只用来兜住「没删干净」这一种情况，
+  # 并不构成卸载后的长期标记——重装是一次全新的启用。
   echo "==> 删除 $DEST"
   rm -rf "$DEST"
 fi

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Mapping, Optional
 
 MAX_ANCESTRY = 12
-REQUIRED = ("HERDR_ENV", "HERDR_PANE_ID")
+REQUIRED = ("HERDR_PANE_ID", "HERDR_BIN_PATH")
 
 
 def read_environ(pid: int, proc_root: Path) -> dict:
@@ -41,7 +41,7 @@ def read_ppid(pid: int, proc_root: Path) -> Optional[int]:
 
 
 def discover_herdr_env(proc_root: Path = Path("/proc"), start_pid: Optional[int] = None) -> Optional[Mapping[str, str]]:
-    """向上回溯，找到第一个 HERDR_ENV=1 且有 HERDR_PANE_ID 的祖先。
+    """向上回溯，找到第一个 HERDR_ENV=1 且 HERDR_PANE_ID、HERDR_BIN_PATH 均非空的祖先。
 
     找不到时返回 None —— 调用方据此完全静默退出。
     """

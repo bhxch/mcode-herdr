@@ -128,6 +128,11 @@ class ReplayTest(unittest.TestCase):
             return []
         return [line for line in self.log.read_text().splitlines() if line]
 
+    def states(self):
+        """按调用顺序抽出上报过的状态序列（socket 不可用时全部走 CLI）。"""
+        return [c.split("--state ", 1)[1].split()[0]
+                for c in self.calls() if "--state " in c]
+
     def state_file(self):
         return json.loads(Store(self.data).path_for("w9:p9").read_text())
 
@@ -196,17 +201,85 @@ class ReplayTest(unittest.TestCase):
         self.assertNotIn("--state idle", self.calls()[-1])
         self.assertEqual(len(self.calls()), 2)  # 子代理的 stop 被完全忽略
 
-    def test_ask_user_blocked_then_post_clears(self):
+    def test_ask_user_blocked_survives_post_tool_and_stop_until_answered(self):
+        """P0 回归：按真机时序回放，blocked 必须一直挂到用户作答为止。
+
+        真机（mcode 0.6.3，0.1s 轮询 pane 状态）测到的时序与结果：
+          prompt → blocked（+3103ms，正确）→ 121ms 后被翻成 working（错）
+          → 又 123ms 后自称 done（错），而问卷还开在 TUI 上等人回答。
+        对应的钩子时序是：PreToolUse(ask_user) → PostToolUse(+33ms，带
+        terminate=true / details.waiting_for_user=true) → Stop(+56ms，turn 结束)
+        → 35.8s 后用户作答，重新触发 UserPromptSubmit（换了新的 turn_id）。
+
+        所以 blocked 的解除条件只有一个：作答。它既不是 PostToolUse，也不是 Stop。
+        """
+        root = "mvs_9b41e0c7d5f84a2eb3c6d90f17a48b25"  # 与实测样本同一会话
+        run("session-start", json.dumps({"hook_event_name": "SessionStart", "session_id": root}),
+            self.env, self.data)
+        run("user-prompt", json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": root}),
+            self.env, self.data)
+        run("pre-tool", json.dumps({"hook_event_name": "PreToolUse", "session_id": root,
+                                    "tool_name": "ask_user",
+                                    "tool_input": {"mode": "questionnaire"}}),
+            self.env, self.data)
+        self.assertIn("--state blocked", self.calls()[-1])
+        reported_before = len(self.calls())
+
+        # ask_user 提前收工：tool_response 带 terminate + waiting_for_user=true，问卷还开着
+        run("post-tool", (FIXTURES / "post_tool_ask_user_waiting.json").read_text(),
+            self.env, self.data)
+        # turn 随即结束，人还杵在问卷前 —— 绝不能报 idle
+        run("stop", json.dumps({"hook_event_name": "Stop", "session_id": root,
+                                "stop_hook_active": False}), self.env, self.data)
+
+        # 这两步一个字节都不许上报：121ms 的假 working 和随后的 done 正是原 bug
+        self.assertEqual(len(self.calls()), reported_before)
+        self.assertEqual(self.state_file()["blocked_by"], root)
+        self.assertEqual(self.state_file()["last_reported"], "blocked")
+
+        # 作答 = 一次新的 UserPromptSubmit，走的是清障分支
+        run("user-prompt", json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": root}),
+            self.env, self.data)
+        self.assertIn("--state working", self.calls()[-1])
+        self.assertIsNone(self.state_file()["blocked_by"])
+
+        # 恢复后的 turn 正常收尾
+        run("stop", json.dumps({"hook_event_name": "Stop", "session_id": root,
+                                "stop_hook_active": False}), self.env, self.data)
+        self.assertEqual(self.states(), ["idle", "working", "blocked", "working", "idle"])
+
+    def test_ask_user_from_subagent_stays_blocked_until_root_prompt(self):
+        """子代理提问同理：blocked_by 记子会话，只能由根会话的 UserPromptSubmit 解开。
+
+        人对着子代理弹出的问卷作答，pane 归谁管都不能变 —— 这条路径的正解是
+        user-prompt 分支要求 payload.session_id == root_session，子会话自己的
+        UserPromptSubmit 一律忽略，所以不可能被误清。
+        """
         root = "mvs_root"
         run("session-start", json.dumps({"hook_event_name": "SessionStart", "session_id": root}),
             self.env, self.data)
+        run("user-prompt", json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": root}),
+            self.env, self.data)
         run("pre-tool", (FIXTURES / "pre_tool_subagent.json").read_text(), self.env, self.data)
         self.assertIn("--state blocked", self.calls()[-1])
-        run("post-tool", json.dumps({"hook_event_name": "PostToolUse", "session_id": "mvs_child_123",
-                                     "tool_name": "ask_user", "tool_input": {},
-                                     "tool_response": {}, "tool_use_id": "c1"}),
+        reported_before = len(self.calls())
+
+        # 子代理的问卷也开着：它自己的 PostToolUse（waiting_for_user）与随后的 Stop 都空转
+        run("post-tool", json.dumps({
+            "hook_event_name": "PostToolUse", "session_id": "mvs_child_123",
+            "tool_name": "ask_user", "tool_input": {"mode": "questionnaire"},
+            "tool_response": {"terminate": True,
+                              "details": {"waiting_for_user": True}},
+            "tool_use_id": "call_function_child_1"}), self.env, self.data)
+        run("stop", json.dumps({"hook_event_name": "Stop", "session_id": root,
+                                "stop_hook_active": False}), self.env, self.data)
+        self.assertEqual(len(self.calls()), reported_before)
+        self.assertEqual(self.state_file()["blocked_by"], "mvs_child_123")
+
+        # 人作答：根会话续上新 turn → 解障
+        run("user-prompt", json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": root}),
             self.env, self.data)
-        self.assertIn("--state working", self.calls()[-1])
+        self.assertEqual(self.states(), ["idle", "working", "blocked", "working"])
 
     def test_session_end_releases_with_seq(self):
         root = "mvs_root"

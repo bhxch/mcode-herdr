@@ -59,18 +59,26 @@ cd mcode-herdr
 
 （`<owner>` 换成实际仓库归属。）
 
-`install.sh` 做五件事：
+`install.sh` 做这些事。安装时是唯一有人在场、能低成本发现静默失败的时刻，
+所以每种失败都在这里给出**可操作的**结论，而不是留一个静默的 no-op 给以后：
 
-1. 把 `plugin/` 整目录**复制**（不是链接）到 `$MINIMAX_DATA_DIR/plugins/mcode-herdr/`
-   （默认 `~/.minimax/plugins/mcode-herdr`）；先 `rm -rf` 旧目录再复制，
-   并清掉 `__pycache__`、给 `scripts/*.py` 补上可执行位
-2. 用 `mcode plugin list -m local --available` 验证本地市场确实发现了它，
-   grep 不到就**直接失败退出**并提示检查 `icon` 字段
-3. 检查恢复命令 `mcode` 能否被 herdr 执行：先看**当前环境**的 PATH，
+1. 删不掉东西时拒绝执行：`DEST` 必须是绝对路径且末段恰好是 `mcode-herdr`
+2. 若 `$DEST` 是**符号链接**则拒绝执行 —— 继续下去只会把你的链接悄悄换成真实目录，
+   而 mcode 本来就不认符号链接目录（见[§2.2.1](#221-符号链接会被静默忽略最常见的失败方式)）
+3. 把 `plugin/` 整目录**复制**（不是链接）到 `$MINIMAX_DATA_DIR/plugins/mcode-herdr/`
+   （默认 `~/.minimax/plugins/mcode-herdr`）；先 `rm -rf` 旧目录再复制，并清掉 `__pycache__`
+4. **自检安装产物**：四个清单路径里必须有一个**直接**位于 `$DEST` 下（见
+   [§2.2.3](#223-目录层级差一层就没了)）；`hooks/hooks.json`、`scripts/herdr-report.py`、
+   `icon.png` 必须真实存在。复制被截断或层级错了当场报错，不留到运行期才表现为
+   「插件什么都不做」。通过之后才 `chmod +x scripts/*.py` —— 顺序反了会让 glob 落空的
+   报错盖住真正原因
+5. 用 `mcode plugin list -m local --available` 验证本地市场**发现了它，而且处于启用态**
+   （优先读 `--json` 的 `enabled` 字段，表格的 `[*]`/`[-]` 标记兜底）。
+   被禁用会**自动重新启用**并明确告诉你，见[§2.2.4](#224-disable-会跨重装残留)
+6. 检查恢复命令 `mcode` 能否被 herdr 执行：先看**当前环境**的 PATH，
    再看 **herdr server 进程**的 PATH（那才是真正执行恢复命令的环境）；两处都找不到才警告，
    见[§7](#7-恢复命令依赖-mcode-在-herdr-server-的-path-上)
-4. 删不掉东西时拒绝执行（`DEST` 必须是绝对路径且末段恰好是 `mcode-herdr`）
-5. 提示你重启 mcode
+7. 提示你重启 mcode
 
 用非默认 profile（换整个 data dir）：
 
@@ -103,6 +111,11 @@ mcode-herdr 条目形如（实测）：
 **`installed` 与 `enabled` 都不需要你去做什么操作**——本地插件被发现即视为已安装已启用，
 原因见[§2.2.2](#222-不要跑-mcode-plugin-add)。
 
+唯一的例外是 `enabled`：只要有人跑过一次 `mcode plugin disable`，禁用名单就会
+**跨重装残留**，而 mcode 不会为此提示任何东西。所以确认启用态不能只看「列表里有这一行」，
+要看前缀是 `[*]` 还是 `[-]`——完整说明和修复命令见[§2.2.4](#224-disable-会跨重装残留)。
+`./install.sh` 会替你检查这一项并在禁用时自动恢复。
+
 ```bash
 # 2) 在 herdr pane 里重启 mcode，跑一轮（随便发一条提示），然后：
 herdr agent list
@@ -111,15 +124,16 @@ herdr agent list
 出现 `mcode` 行、状态随你的操作在 `idle` / `working` / `blocked` 之间流转，就是装好了。
 还是空的话直接看[§8 排障](#8-排障)。
 
-### 2.2 三个静默失败陷阱
+### 2.2 四个静默失败陷阱
 
-**下面三种装法不会报错，只会让你装了个寂寞。** 本节是全文最该先读的部分。
+**下面四种装法不会报错，只会让你装了个寂寞。** 本节是全文最该先读的部分。
 
 | # | 别这么做 | 实测结果 | 正确做法 |
 | --- | --- | --- | --- |
 | 1 | `ln -s <repo>/plugin ~/.minimax/plugins/mcode-herdr` | `mcode plugin list -m local --available` 返回**空**，一个字都不提示 | **复制**。`./install.sh` 就是复制；改完代码重跑它 |
 | 2 | `mcode plugin add -m local mcode-herdr` | 报 `LOCAL_PLUGIN_INSTALL_UNSUPPORTED`，直接失败 | **不要跑**。被发现即 installed + enabled |
 | 3 | 复制到 `~/.minimax/plugins/wrapper/plugin/...`（多套一层目录） | 扫描不到，**无任何诊断** | 插件目录必须**直接**含一份清单文件 |
+| 4 | 跑过 `mcode plugin disable -m local mcode-herdr` 之后再重装 | 重装完仍是 `[-] disabled`，插件什么都不做 | `mcode plugin enable -m local mcode-herdr`（`./install.sh` 会自动替你做） |
 
 #### 2.2.1 符号链接会被静默忽略（最常见的失败方式）
 
@@ -147,6 +161,19 @@ herdr agent list
 本地市场的投影把 `installExists` 硬编码为 `true`（`desktop-facade.ts:630`）。
 换句话说，**插件躺在目录里就是装好了**，跑 `plugin add` 只会让你以为装失败了。
 
+**这个模型值得单独记住，因为上面四个陷阱都由它推出。** 具体说：
+
+- 没有注册表、没有安装记录，`installed` / `enabled` 都是**扫描当下**算出来的派生值。
+  所以「复制目录」就等于「安装」，而**任何写在文件之外的东西都活不过一次 `rm -rf`**
+- 唯一被持久化下来的是那份禁用名单，它存在
+  `<dataDir>/v2/sqlite/runtime-state.sqlite` 的表 `local_runtime_plugin_local_disabled` 里，
+  **以插件目录的 canonical_root 为键**——注意是**路径**，不是插件名，也不是文件内容
+- 因此 `disable` 的效果**与目录里放的是什么完全无关**，重装清不掉它（见[§2.2.4](#224-disable-会跨重装残留)）
+- 同理，因为键是路径，把插件**挪到别的目录再装一份**会得到一个全新的、启用的条目；
+  旧的禁用记录仍留在库里指向老路径。所以「换个地方重装一下」能绕过 disable，
+  是副作用而不是特性
+- `enable` / `disable` / `remove` 对本地插件可用，只有 `add`（install）被硬编码不支持
+
 #### 2.2.3 目录层级差一层就没了
 
 一个目录要算插件，必须**直接**包含下面某一份清单文件：
@@ -162,6 +189,39 @@ claude-plugin/plugin.json
 
 复制到 `plugins/wrapper/plugin/...` 这种多一层的地方，**实测**扫描结果就是「什么都没有」：
 **没有任何诊断信息**，只有空列表。
+
+#### 2.2.4 `disable` 会跨重装残留
+
+**本插件唯一一个「文件是对的、装法是对的，插件却什么都不做」的坑。**
+
+```bash
+mcode plugin disable -m local mcode-herdr     # 之后列表里是 [-] disabled
+./install.sh                                 # rm -rf + 重新复制，文件全新
+mcode plugin list -m local --available       # 依旧是 [-] disabled
+```
+
+原因见[§2.2.2](#222-不要跑-mcode-plugin-add)：禁用名单是 SQLite 里一条
+**按 canonical_root 记录**的行（`<dataDir>/v2/sqlite/runtime-state.sqlite`，
+表 `local_runtime_plugin_local_disabled`），和目录里的文件内容毫无关系。
+`install.sh` 的 `rm -rf` 删的是目录，碰不到数据库。
+
+**修复命令**：
+
+```bash
+mcode plugin enable -m local mcode-herdr
+```
+
+（如果当初 disable 时走的是非默认 profile，这里也要带上同一个
+`MINIMAX_DATA_DIR=...`，否则启用的是另一个 profile 下的条目。）
+
+**`./install.sh` 会替你做这件事**：检测到 `enabled: false` 就自动执行上面的命令，
+并在输出里用 `!!` 前缀明确告诉你「已重新启用」以及怎么撤销
+（`mcode plugin disable -m local mcode-herdr`）。
+
+这是**有意覆盖你的选择**：既然你主动跑了 `install.sh`，这个动作本身就强烈表达了
+「让它能用」的意图；而 mcode 侧对被禁用的插件没有任何提示，把这个状态留给用户去猜
+代价更高。自愈只影响这一条记录、可以用 `disable` 原样撤销，所以脚本不静默处理它，
+而是每次都喊出来。如果你想让禁用就此生效，重跑一次 `mcode plugin disable` 即可。
 
 ### 2.3 关于「本地市场」本身
 
@@ -531,9 +591,14 @@ ln -s "$(command -v mcode)" ~/.local/bin/mcode
 
 按可能性从高到低：
 
-1. **符号链接**。如果你自己动手装过，十有八九是用了 `ln -s`，扫描器直接跳过（见[§2.2](#22-三个静默失败陷阱)）
-2. **目录多套了一层**。插件目录必须**直接**含清单文件（见[§2.2](#22-三个静默失败陷阱)）
-3. **`plugin.json` 缺 `icon` 字段**。mcode 解析本地插件清单时**无条件**要求 `icon`，
+1. **被禁用了**。`mcode plugin list -m local --available` 里这一行是 `[-] disabled`
+   而不是 `[*]` 时，插件文件全都是好的，就是不执行。禁用名单按**路径**记在 SQLite 里，
+   **重跑 `./install.sh` 清不掉**（脚本会检测到并自动重新启用，见
+   [§2.2.4](#224-disable-会跨重装残留)；手动修复是 `mcode plugin enable -m local mcode-herdr`）。
+   注意这行的表现和「完全看不到」不一样：条目还在，只是前缀是 `[-]`
+2. **符号链接**。如果你自己动手装过，十有八九是用了 `ln -s`，扫描器直接跳过（见[§2.2](#22-四个静默失败陷阱)）
+3. **目录多套了一层**。插件目录必须**直接**含清单文件（见[§2.2](#22-四个静默失败陷阱)）
+4. **`plugin.json` 缺 `icon` 字段**。mcode 解析本地插件清单时**无条件**要求 `icon`，
    缺失即判非法（`MANIFEST_SCHEMA_INVALID`）；而本地插件的扫描会把校验失败写进
    `diagnostics` 后**静默跳过**，CLI 上没有任何提示。本项目自己就踩过这个坑
 
@@ -542,8 +607,9 @@ ln -s "$(command -v mcode)" ~/.local/bin/mcode
    `mcpServers` / `skills` 四个数组**也都是必填**（`hooks` 才是可选的），
    缺任何一个的后果与缺 `icon` 一样：整包被静默跳过。完整清单见[§2.4](#24-清单要求顺手写插件时会踩)
 
-如果是用 `./install.sh` 装的，第 1、2 条已经排除了（脚本自己就是复制，
-且 grep 不到就退出）—— 那就查第 3 条。
+如果是用 `./install.sh` 装的，第 2、3、4 条已经排除了（脚本复制而非链接、
+自检清单层级与必需文件、并且发现不了就会退出）—— 那就查第 1 条。
+注意脚本退出码为 0 时它认定的是**「已发现且已启用」**，而不只是「文件复制成功」。
 
 ### 8.2 herdr 里看不到 mcode agent
 

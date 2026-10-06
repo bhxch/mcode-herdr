@@ -42,8 +42,10 @@ herdr 不能改（agent kind 列表编译在二进制里），所以走的是 he
    （默认 `~/.minimax/plugins/mcode-herdr`）；先 `rm -rf` 旧目录再复制，并清掉 `__pycache__`
 2. 用 `mcode plugin list -m local --available` 验证本地市场确实发现了它，
    grep 不到就直接失败退出并提示检查 `icon` 字段
-3. 检查**登录 shell 的 PATH** 上有没有 `mcode`，没有就打印警告
-   （这是会话恢复的硬前提，见 [第 5 节](#5-恢复命令依赖-mcode-在-path-上)）
+3. 检查恢复命令 `mcode` 能否被 herdr 执行：先看**当前环境**的 PATH，
+   再看 **herdr server 进程**的 PATH（那才是真正执行恢复命令的环境）；
+   两处都找不到才打印警告
+   （见 [第 5 节](#5-恢复命令依赖-mcode-在-path-上)）
 4. 提示你重启 mcode
 
 几点需要知道的：
@@ -96,7 +98,7 @@ plugin/scripts/herdr-report.py ── 读 stdin → Popen(start_new_session=True
 | 文件 | 职责 |
 | --- | --- |
 | `plugin/hooks/hooks.json` | 6 个 mcode 事件 → `scripts/herdr-report.py <event>` 的映射 |
-| `plugin/scripts/herdr-report.py` | 钩子入口：读 stdin、派生后台进程、**不等**、立刻返回 |
+| `plugin/scripts/herdr-report.py` | 钩子入口：读 stdin、**先回溯出 herdr 环境**、派生后台进程并把环境传给它、**不等**、立刻返回 |
 | `plugin/scripts/worker.py` | 后台 worker，调 `runtime.main()` |
 | `plugin/scripts/mcode_herdr/env.py` | 沿 `/proc` 父进程链回溯，找回被剥掉的 `HERDR_*` |
 | `plugin/scripts/mcode_herdr/payload.py` | 解析 stdin JSON → `Payload`（宽容归一：空白/空串 → `None`） |
@@ -132,13 +134,19 @@ plugin/scripts/herdr-report.py ── 读 stdin → Popen(start_new_session=True
 
 ### 3.3 入口立即返回，上报交给脱离进程组的后台进程
 
-`herdr-report.py` 只做三件事：读掉 stdin、`Popen` 派生 `worker.py`
-（`start_new_session=True`，stdout/stderr 接 `DEVNULL`）、把载荷写进子进程 stdin，
-然后**直接返回，不 wait**。`herdr-report.py:38` 还特意给 `Popen` 填上 `returncode`，
-避免 GC 时 `__del__` 发 `ResourceWarning` 污染 stderr。
+`herdr-report.py` 只做四件事：读掉 stdin、**先把 herdr 环境回溯出来**、
+`Popen` 派生 `worker.py`（`start_new_session=True`，stdout/stderr 接 `DEVNULL`）、
+把载荷写进子进程 stdin，然后**直接返回，不 wait**。`herdr-report.py:60` 还特意给
+`Popen` 填上 `returncode`，避免 GC 时 `__del__` 发 `ResourceWarning` 污染 stderr。
 
-实测（本机，同一 hook 入口连跑 7 次）：**0.0232 ~ 0.0255 秒**返回，上报在后台完成。
-`test/test_replay.py` 里也把这个量级写进了断言注释。
+**耗时**：本机实测钩子入口 **0.048 ~ 0.051 秒**返回（11 次连续采样，Python 3.14.7）。
+测量方法：用一个临时目录里的假 herdr 二进制 + 临时 `PLUGIN_DATA`，让钩子进程**自身
+环境不含 `HERDR_*`**、假 `HERDR_*` 放在它的直接父进程上 —— 这正是生产形态
+（mcode 给钩子白名单环境，`HERDR_*` 只在祖先进程上），这样既覆盖了 `/proc` 回溯这条路，
+又保证任何上报都不会落到真实 herdr 上。计时器括住的是「父进程 → 钩子 → 返回」整段。
+同一台机器上另一次在更繁忙的时段量到 0.068 ~ 0.182 秒，所以**这个数字只能当量级看**，
+随机器负载浮动。参考量：`python3 -c pass` 本身约 0.010 秒，即钩子入口约为解释器冷启动的 5 倍。
+上报在后台完成，与这个数字无关。`test/test_replay.py` 的断言阈值取 1.0 秒（留了 20 倍余量）。
 
 钩子挂在内联路径上，**一个字节都不能往 stdout/stderr 写** —— `PreToolUse` 的输出会被
 mcode 运行时消费，污染可能改变工具执行结果。回放测试对此有硬断言
@@ -146,9 +154,14 @@ mcode 运行时消费，污染可能改变工具执行结果。回放测试对�
 
 ### 3.4 找回 `HERDR_*`：`/proc` 父进程链回溯
 
-这是整个插件最硬的一个约束。mcode 派发钩子子进程时给的是一个**严格白名单环境**
-（`safeHookEnvironment()`：`PATH HOME LANG TERM SHELL USER TMPDIR TEMP TMP PATHEXT
-SystemRoot ComSpec USERPROFILE HOMEDRIVE HOMEPATH APPDATA LOCALAPPDATA`），
+这是整个插件最硬的一个约束。mcode 派发钩子子进程时给的是一个**按名字逐个挑出来的
+白名单环境**，只含：
+
+```
+PATH HOME LANG TERM SHELL USER TMPDIR TEMP TMP PATHEXT
+SystemRoot ComSpec USERPROFILE HOMEDRIVE HOMEPATH APPDATA LOCALAPPDATA
+```
+
 **`HERDR_*` 一个都不传**（设计文档 §2.7 的探针实测：钩子里这些变量全空）。
 
 所以 `env.py` 只能自己去找：从自己的 pid 出发，沿 `/proc/<pid>/status` 的 `PPid:`
@@ -159,9 +172,16 @@ SystemRoot ComSpec USERPROFILE HOMEDRIVE HOMEPATH APPDATA LOCALAPPDATA`），
 父进程号必须读 `status` 里的 `PPid:`，不能按位置解析 `/proc/<pid>/stat` ——
 `comm` 含空格或括号会直接错位（探针第一版就踩了这个坑，只回溯到 depth=0）。
 
-`runtime._resolve_herdr_env` 还有一条捷径：如果当前进程环境里**本来就有**
-`HERDR_ENV=1` 和 `HERDR_PANE_ID`（例如在 herdr pane 里手工跑 `worker.py`、或回放测试注入假环境），
-就直接采信，不再翻 `/proc`。生产环境的钩子永远走不到这条分支。
+**这条回溯必须由钩子进程自己完成，并在派生 worker 之前做完。** 后台 worker 一脱离，
+父进程就退出、worker 被 init 收养（`start_new_session` 只换会话组，不改父子关系），
+`/proc` 父链随之断在 `pid<=1` 的守卫上，worker 自己的回溯恒返回 `None`。这个坑踩过：
+真机上量到 `worker MY_PPID = 1`、钩子照常触发、状态文件一个都不写、
+`herdr agent list` 永远是空的。所以 `herdr-report.py` 在**父进程里**就把结果取出来，
+连同 `child_env` 一起用 `env=` 交给 worker；解析不到（不在 herdr 里）时连 worker 都不派生。
+
+`runtime._resolve_herdr_env` 因此有两级：先采信子进程环境里**显式存在**的 `HERDR_*`
+（生产主路径就是它 —— 上面 `herdr-report.py` 注入的；在 herdr pane 里手工跑 `worker.py`
+也走这条），没有才回退到 `/proc` 回溯（回放测试注入假环境、或手工在 mcode 进程树里跑时命中）。
 
 ### 3.5 状态：每个 pane 一个 JSON
 
@@ -189,13 +209,33 @@ SystemRoot ComSpec USERPROFILE HOMEDRIVE HOMEPATH APPDATA LOCALAPPDATA`），
 
 | 动作 | 条件 | 结果 |
 | --- | --- | --- |
+| `session-start` | 载荷里没有 `session_id` | 忽略 |
 | `session-start` | 上次状态是 `working` | 忽略（判定为子代理创建） |
 | `session-start` | 否则 | 上报 `idle`，认领 `root_session`，附带会话 id 与恢复命令 |
-| `user-prompt` | 会话 == `root_session` | 上报 `working`，清 `blocked_by` |
+| `user-prompt` | 会话 == `root_session` | 上报 `working`，**清 `blocked_by`** |
 | `pre-tool` | `tool_name == ask_user` | 上报 `blocked`，记 `blocked_by = 本会话` |
-| `post-tool` | `tool_name == ask_user` 且 `blocked_by == 本会话` | 上报 `working`，清 `blocked_by` |
-| `stop` | 会话 == `root_session` | 上报 `idle` |
+| `post-tool` | `tool_name == ask_user` 且 `details.waiting_for_user == true` | **忽略，保持 `blocked`** |
+| `post-tool` | `tool_name == ask_user`，没有待答问卷，且 `blocked_by == 本会话` | 上报 `working`，清 `blocked_by`（防御性路径） |
+| `stop` | 会话 != `root_session` | 忽略 |
+| `stop` | `blocked_by` 非空 | 忽略（turn 结束 ≠ 问题解决） |
+| `stop` | 否则 | 上报 `idle` |
 | `session-end` | 会话 == `root_session` | `release-agent` 交还 pane，并清空该 pane 的状态 |
+
+**「怎么知道 pane 被卡住了」的真机依据**（mcode 0.6.3，交互式会话，11 个钩子事件全订阅）：
+`ask_user` **不阻塞**这次工具调用，它在 `PreToolUse` 之后约 33ms 就带着
+`terminate=true`、`details.waiting_for_user=true` 返回，随后约 56ms 就来 `Stop` ——
+**turn 结束的时候问卷还开在 TUI 上**。所以：
+
+- `PostToolUse` 带 `waiting_for_user=true` 是「还在等」的信号，**不是「已答」**，
+  必须保持 `blocked`；
+- `Stop` 只表示这一轮 turn 结束，**不表示问题已解决**，所以 `blocked_by` 非空时
+  不翻 `idle`（翻了等于对外宣称「任务完成」）；
+- **真正的解障信号是用户作答**：作答算一次新的用户提示，会以新的 `turn_id` 重新触发
+  `UserPromptSubmit`（实测那一轮在上一轮 `Stop` 之后约 27s），由 `user-prompt` 分支解开。
+
+按错误语义实现时，真实 herdr 上量到 `blocked` 只存活 **121ms** 就被 `working`、
+再被 `done` 覆盖掉；按上表实现后实测是
+`+0ms idle | +2s working | +4s blocked ... held 15.8s ... +18s working | +19s done`。
 
 **与上次相同的状态不上报**（`last_reported` 去重），因为 herdr 自己的通知也是按状态跃迁
 派生并自带去重的，重复上报没有收益。这也是为什么恢复命令必须挂在 `session-start` 上 ——
@@ -246,16 +286,26 @@ mcode 给每个子代理**独立的 `session_id`**。所以「`session_id != roo
 - `session-start` 在 pane 处于 `working` 时到达 → **忽略**，当作子代理被创建。
   子代理总是在父 agent 干活期间被创建的，所以这个启发式够用
 
-但 **`blocked` 不能这样过滤**。子代理完全可能调 `ask_user`，而**此时确实有一个真人
-被卡住了** —— pane 明明停在等人回答上，herdr 却显示 `working` 且永远不通知，
+但 **`blocked` 不能这样过滤**。设计上必须假定子代理**可能**调 `ask_user`，而**此时确实有
+一个真人被卡住了** —— pane 明明停在等人回答上，herdr 却显示 `working` 且永远不通知，
 这是最坏的一种错配。所以子代理的 `ask_user` 照报 `blocked`。
 
-代价是必须知道**是谁置的位**：状态文件里记 `blocked_by`，`post-tool` 只在
-`payload.session_id == blocked_by` 时才把 `blocked` 清回 `working`。
+代价是必须知道**是谁置的位**：状态文件里记 `blocked_by`，
+`post-tool` 只在 `payload.session_id == blocked_by` 时才可能把 `blocked` 清回 `working`。
 子代理答完问题，只清自己置的那一次阻塞，不会误清根会话正在等的另一次决策。
 
 一句话：`working` / `idle` 按「谁是这个 pane 的根会话」过滤，`blocked` 按
 「谁真的把人卡住了」过滤。
+
+**关于这个例外，有一条真机结论要讲清楚**（mcode 0.6.3）：**子代理根本没有 `ask_user`
+这个工具**。真机分别派了 `explore` 与 `mavis` 两种子代理去尝试提问，两者独立报告
+调不到、只有顶层 agent 能调（`explore` 报出自己的工具是 bash / glob / grep / read /
+web_fetch）。所以上面这条例外分支在当前版本是**前瞻性防御**，不是可达路径 ——
+回放测试里那条用例是用构造载荷覆盖的。
+
+子代理的 `session_id` 管道仍然保留：mcode 某个版本真把 `ask_user` 暴露给子代理时，
+这套机制不用改设计就能接上。**而真机上确实验证过的是**：子代理干活期间，pane 全程停在
+`working`，从未被翻成 `idle`。
 
 ---
 
@@ -270,8 +320,12 @@ mcode 给每个子代理**独立的 `session_id`**。所以「`session_id != roo
 不含控制字符、不含单引号。
 
 于是就有一个**很容易被忽略的约束**：如果 `mcode` 不在 **herdr server 的 PATH** 上，
-恢复会**静默失败**（面板状态照常上报，只有恢复不工作）。`install.sh` 会检查
-**登录 shell** 的 PATH 上有没有 `mcode`，没有就打警告：
+恢复会**静默失败**（面板状态照常上报，只有恢复不工作）。`install.sh` 会分两级检查：
+先看**当前环境**的 PATH 上有没有 `mcode`，没有再读 **herdr server 进程**的 PATH
+（`/proc/<pid>/environ`）——后者才是真正执行恢复命令的那份环境。
+
+（这里特意不用「登录 shell 的 PATH」：登录 shell 不读 `~/.bashrc`，而本机 mcode 的
+PATH 正是从 `~/.bashrc` 加的，用登录 shell 判断会每次都误报成「找不到 mcode」。）
 
 ```bash
 ln -s "$(command -v mcode)" ~/.local/bin/mcode
@@ -287,13 +341,15 @@ ln -s "$(command -v mcode)" ~/.local/bin/mcode
 
 ### 6.1 `mcode plugin list -m local --available` 什么都看不到
 
-**几乎总是因为 `plugin.json` 缺 `icon` 字段。** mcode 的 `readManifestIcon()` 无条件要求它，
-缺失即判定清单非法；而本地插件的扫描会把校验失败写进 `diagnostics` 后**静默跳过**，
-CLI 上没有任何提示（官方插件全都带 `icon`，所以缺字段的本地包看起来就像「市场整体失效」）。
-本项目自己就踩过这个坑。
+**几乎总是因为 `plugin.json` 缺 `icon` 字段。** mcode 解析本地插件清单时**无条件**
+要求 `icon`，缺失即判定清单非法（`MANIFEST_SCHEMA_INVALID`）；而本地插件的扫描会把校验
+失败写进 `diagnostics` 后**静默跳过**，CLI 上没有任何提示（官方插件全都带 `icon`，
+所以缺字段的本地包看起来就像「市场整体失效」）。本项目自己就踩过这个坑。
 
 `plugin/.minimax-plugin/plugin.json` 里必须有 `"icon": "icon.png"`，
-且 `plugin/icon.png` 真实存在（1×1 PNG）。
+且 `plugin/icon.png` 真实存在（1×1 PNG）。另外 `exampleQueries` / `apps` /
+`mcpServers` / `skills` 四个数组**也都是必填**（`hooks` 才是可选的），
+缺任何一个的后果与缺 `icon` 一样：整包被静默跳过。
 
 ### 6.2 herdr 里看不到 mcode agent
 
@@ -318,7 +374,12 @@ herdr agent explain <TARGET>      # 解释某个 agent 的检测状态
 该目录由 mcode 决定，形如 `<profile>/v2/plugin-data/hooks/<插件名>/`
 （推导见 mcode 源码 `plugin-system/plugin/runtime/package-storage.ts`；本机 mcode 0.6.3 上
 `~/.minimax/v2/plugin-data/hooks/` 下确实存在 `herdr-probe`、`lark` 两个同名目录 ——
-但 `mcode-herdr` 自身尚未在本机安装，所以下面这个具体路径未经实跑确认）。直接找：
+但 `mcode-herdr` 自身尚未在本机安装，所以下面这个具体路径未经实跑确认）。
+
+⚠️ **这个目录是插件的钩子第一次真正触发之后才被创建的。** 刚装完、还没跑过一轮
+mcode 会话时，`ls` 它会报「No such file or directory」—— 那不代表装坏了，
+只代表还没有任何钩子跑过。跑一轮之后（哪怕只是在 herdr pane 里开一个新会话
+再发一条提示）它就会出现。直接找：
 
 ```bash
 ls -l "${MINIMAX_DATA_DIR:-$HOME/.minimax}"/v2/plugin-data/hooks/mcode-herdr/
@@ -335,9 +396,10 @@ cat "${MINIMAX_DATA_DIR:-$HOME/.minimax}"/v2/plugin-data/hooks/mcode-herdr/w4_p3
 
 离线回放，**完全不涉及 herdr 与 mcode**：喂真实的钩子载荷样本
 （`test/fixtures/`，每个样本的来源见 `test/fixtures/README.md`），用假 herdr 二进制
-逐条记录 argv / socket 请求，再断言调用序列与状态流转。当前 **89 个用例全绿**。
-样本里唯一从未实时抓到的是子代理工具事件，它按 mcode 的字段契约构造，
-所以子代理路径的字段名变更风险未被真实抓包覆盖。
+逐条记录 argv / socket 请求，再断言调用序列与状态流转。当前 **102 个用例全绿**。
+样本里从未实时抓到的只有子代理工具事件（按 mcode 的字段契约构造），所以子代理路径的
+字段名变更风险未被真实抓包覆盖 —— 而且如第 4 节所述，mcode 0.6.3 的子代理根本调不到
+`ask_user`，这条路径当前连构造动机都有限。
 
 **验证状态说明**：本仓库自带的是离线回放测试。端到端（在真实 herdr pane 里跑 mcode、
 断言 `herdr agent list` 出现 mcode 并正确流转、herdr server 重启后会话恢复）

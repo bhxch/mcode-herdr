@@ -10,9 +10,14 @@ tool_response.details.waiting_for_user，是 ask_user 问卷是否仍在等人�
 缺失、null 或任何非布尔取值一律归一为 False，绝不抛。
 
 只有 SessionEnd 带 reason，取自**顶层** payload.reason（不埋在 tool_response 里），
-它是「这次结束到底发生了什么」的权威信号：五种取值里只有 logout 表示进程真的退出，
-idle_timeout / clear / archive / resume_other 时 mcode 都还在跑。走同一套 _text 宽容
-归一：非字符串、缺失、纯空白一律 None，绝不抛。
+它是「这次结束到底发生了什么」的权威信号。走同一套 _text 宽容归一：非字符串、缺失、
+纯空白一律 None，绝不抛。
+
+注意这里收到的是**线上取值，不是 mcode 内部的联合类型**。内部
+archive 与 idle_timeout 在上线前会被 compatibleSessionEndReason（runner.ts）
+合并成 other，resume_other 被改写成 resume。所以线上的取值只有：
+logout（唯一表示进程真的退出）、clear、resume、other。想看内部语义得读 TS 源码，
+不能直接把那个 union 当线格式抄过来。
 """
 from __future__ import annotations
 

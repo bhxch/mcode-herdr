@@ -9,11 +9,12 @@ CHILD = "sess-child"
 
 
 def p(event, session_id=ROOT, tool_name=None, agent_id=None, source=None,
-      waiting_for_user=False):
+      waiting_for_user=False, session_end_reason=None):
     return Payload(event=event, session_id=session_id, tool_name=tool_name,
                    agent_id=agent_id, agent_type=None, source=source,
                    cwd="/tmp", stop_hook_active=False,
-                   waiting_for_user=waiting_for_user)
+                   waiting_for_user=waiting_for_user,
+                   session_end_reason=session_end_reason)
 
 
 class DecideTest(unittest.TestCase):
@@ -151,12 +152,79 @@ class DecideTest(unittest.TestCase):
         st = PaneState(root_session=ROOT, last_reported="working")
         self.assertIsNone(decide(Action("stop"), p("Stop", session_id=CHILD), st))
 
-    def test_session_end_releases_only_current_root(self):
-        d = decide(Action("session-end"), p("SessionEnd"), PaneState(root_session=ROOT))
+    def test_session_end_logout_releases_current_root(self):
+        """五种 reason 里只有 logout 表示进程真的退了，其余四种 mcode 都还在跑。"""
+        d = decide(Action("session-end"), p("SessionEnd", session_end_reason="logout"),
+                   PaneState(root_session=ROOT))
         self.assertEqual(d.kind, Decision.Kind.RELEASE)
 
-    def test_session_end_from_child_does_not_release(self):
-        self.assertIsNone(decide(Action("session-end"), p("SessionEnd", session_id=CHILD), PaneState(root_session=ROOT)))
+    def test_session_end_logout_from_child_does_not_release(self):
+        """结束的不是当前会话，绝不许动 root 的状态。
+
+        reason 必须取 logout：否则子会话的 SessionEnd 会先被 reason 分支放行，这条用例
+        变成在测「子会话的 logout」，而 root 匹配守卫从此再没有覆盖。
+        """
+        self.assertIsNone(decide(Action("session-end"),
+                                 p("SessionEnd", session_id=CHILD, session_end_reason="logout"),
+                                 PaneState(root_session=ROOT)))
+
+    def test_session_end_idle_timeout_is_a_complete_no_op(self):
+        """P0 回归：turn 结束 30 分钟后 mcode 会发 SessionEnd(idle_timeout)，进程还活着。
+
+        原实现对一切 SessionEnd 都 release，于是空闲半小时后 pane 里的 agent 无故消失，
+        而 mcode 还杵在提示符前 —— herdr 自己的规矩是「只有用户真的退出才交还 pane」。
+        这里一个字节都不许动：root_session 一旦被清，用户回来敲的第一条 UserPromptSubmit
+        会因为认不出会话而被状态机忽略，pane 要一直静默到某个无关的 SessionStart 为止。
+        """
+        st = PaneState(root_session=ROOT, last_reported="idle")
+        self.assertIsNone(decide(Action("session-end"),
+                                 p("SessionEnd", session_end_reason="idle_timeout"), st))
+
+    def test_session_end_session_switch_resets_without_releasing(self):
+        """clear / archive / resume_other：进程还在，但会话已经换了。
+
+        要清的是**会话身份**，不是 pane 上的 agent 登记：留着 last_reported="working" 的话，
+        紧接着到来的新会话 SessionStart 会命中「working ⇒ 必然是子代理」被吞掉，新会话
+        永远认领不了这个 pane，之后它的钩子全部被忽略。归属判活在这里救不了 —— 换会话的
+        前后是**同一个**活着的进程。
+        """
+        for reason in ("clear", "archive", "resume_other"):
+            with self.subTest(reason=reason):
+                st = PaneState(root_session=ROOT, blocked_by=ROOT, last_reported="working")
+                d = decide(Action("session-end"), p("SessionEnd", session_end_reason=reason), st)
+                self.assertEqual(d.kind, Decision.Kind.RESET)
+                self.assertNotEqual(d.kind, Decision.Kind.RELEASE)
+                self.assertEqual(d.state, "")  # 不上报任何状态，交给新会话的 SessionStart
+
+    def test_session_start_after_a_session_switch_is_not_swallowed(self):
+        """换会话之后的新 SessionStart 必须真的认领得下来（上面那个 working 陷阱的正解）。"""
+        st = PaneState(root_session=ROOT, last_reported="working")
+        reset = decide(Action("session-end"), p("SessionEnd", session_end_reason="resume_other"), st)
+        self.assertEqual(reset.kind, Decision.Kind.RESET)
+        # 运行时按 RESET 清空这三个字段后，新会话的 SessionStart 走的就是这条路径
+        st.root_session = None
+        st.blocked_by = None
+        st.last_reported = None
+        d = decide(Action("session-start"), p("SessionStart", session_id="sess-new"), st)
+        self.assertEqual(d.kind, Decision.Kind.REPORT)
+        self.assertEqual(d.new_root_session, "sess-new")
+
+    def test_session_end_without_reason_is_not_released(self):
+        """早于 reason 字段的 mcode：不能一律当成「用户退出了」。
+
+        那样的话，任何非退出事件都会把 agent 从 pane 上摘掉。保守代价有界：真退出时
+        herdr 自己的「agent 进程没了」安全网会在一两秒后收掉它。
+        """
+        d = decide(Action("session-end"), p("SessionEnd"), PaneState(root_session=ROOT))
+        self.assertIsNot(d.kind if d else None, Decision.Kind.RELEASE)
+
+    def test_session_end_unknown_reason_is_not_released(self):
+        """认不出来的 reason 一律不 release：看不懂的信号绝不能当退出处理。"""
+        for reason in ("some_future_reason", "LOGOUT", "quitting"):
+            with self.subTest(reason=reason):
+                d = decide(Action("session-end"), p("SessionEnd", session_end_reason=reason),
+                           PaneState(root_session=ROOT))
+                self.assertIsNot(d.kind if d else None, Decision.Kind.RELEASE)
 
     def test_unchanged_state_is_deduped(self):
         st = PaneState(root_session=ROOT, last_reported="working")

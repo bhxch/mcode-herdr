@@ -311,20 +311,20 @@ class ReplayTest(unittest.TestCase):
         root = "mvs_root"
         run("session-start", json.dumps({"hook_event_name": "SessionStart", "session_id": root}),
             self.env, self.data)
-        run("session-end", json.dumps({"hook_event_name": "SessionEnd", "session_id": root}),
-            self.env, self.data)
+        run("session-end", json.dumps({"hook_event_name": "SessionEnd", "session_id": root,
+                                       "reason": "logout"}), self.env, self.data)
         self.assertIn("pane release-agent", self.calls()[-1])
         self.assertIn("--seq", self.calls()[-1])
 
     def test_session_end_clears_state_so_next_session_is_adopted(self):
-        """release 必须清状态，否则新会话永远接不上 pane。"""
+        """logout 的 release 必须清状态，否则新会话永远接不上 pane。"""
         old, new = "mvs_root", "mvs_next"
         run("session-start", json.dumps({"hook_event_name": "SessionStart", "session_id": old}),
             self.env, self.data)
         run("user-prompt", json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": old}),
             self.env, self.data)
-        run("session-end", json.dumps({"hook_event_name": "SessionEnd", "session_id": old}),
-            self.env, self.data)
+        run("session-end", json.dumps({"hook_event_name": "SessionEnd", "session_id": old,
+                                       "reason": "logout"}), self.env, self.data)
         run("session-start", json.dumps({"hook_event_name": "SessionStart", "session_id": new}),
             self.env, self.data)
         # 残留的 last_reported="working" 会让 decide() 把 B 的 SessionStart 当成子代理直接忽略，
@@ -334,6 +334,110 @@ class ReplayTest(unittest.TestCase):
         state = self.state_file()
         self.assertEqual(state["root_session"], new)      # 不是残留的 old
         self.assertEqual(state["last_reported"], "idle")  # 是 B 自己的 idle，不是残留的 working
+
+    def test_idle_timeout_keeps_the_agent_but_logout_releases_it(self):
+        """P0 回归：同为 SessionEnd，空闲超时绝不能把 agent 从 pane 上摘掉。
+
+        herdr 的规矩是「只有用户真的退出才交还 pane；同进程内换了会话就报新会话而不是
+        release」。mcode 的 SESSION_IDLE_MS 是 30 分钟，一轮对话结束半小时后它就会发
+        SessionEnd(idle_timeout)，此时进程还在、提示符还杵在那儿。原来的「一切 SessionEnd
+        都 release」让 agent 无故消失 —— 而 herdr 自己的「进程没了就清 agent」安全网在
+        这里根本不会触发（pane 的前台进程组里有活着的 mcode）。
+
+        两个 reason 跑在同一份状态上，构成直接对照：idle_timeout 必须既不调
+        release-agent 也不改状态，logout 必须调。
+        """
+        root = "mvs_root"
+        for action, extra in (("session-start", {"source": "startup"}),
+                              ("user-prompt", {}),
+                              ("stop", {"stop_hook_active": False})):
+            run(action, json.dumps({"hook_event_name": {"session-start": "SessionStart",
+                                                        "user-prompt": "UserPromptSubmit",
+                                                        "stop": "Stop"}[action],
+                                    "session_id": root, **extra}), self.env, self.data)
+        self.assertIn("--state idle", self.calls()[-1])
+        before = self.state_file()
+        reported_before = len(self.calls())
+
+        run("session-end", json.dumps({"hook_event_name": "SessionEnd", "session_id": root,
+                                       "reason": "idle_timeout"}), self.env, self.data)
+        self.assertEqual(len(self.calls()), reported_before)
+        self.assertNotIn("pane release-agent", "\n".join(self.calls()))
+        # 状态必须原封不动：清掉 root_session 的话，用户回来敲的第一条 UserPromptSubmit
+        # 会因为认不出会话被忽略，pane 要静默到某个无关的 SessionStart 为止
+        self.assertEqual(self.state_file(), before)
+        self.assertEqual(self.state_file()["root_session"], root)
+
+        # 同一份状态，logout 就必须交还 pane —— 证明分流确实由 reason 驱动
+        run("session-end", json.dumps({"hook_event_name": "SessionEnd", "session_id": root,
+                                       "reason": "logout"}), self.env, self.data)
+        self.assertIn("pane release-agent", self.calls()[-1])
+        self.assertIsNone(self.state_file()["root_session"])
+
+    def test_session_end_without_reason_keeps_the_agent_registered(self):
+        """早于 reason 字段的 mcode：非退出的事件不许 release。
+
+        保守的代价有界：真退出时 herdr 自己的「agent 进程没了」安全网会在一两秒后收掉它。
+        """
+        root = "mvs_root"
+        run("session-start", json.dumps({"hook_event_name": "SessionStart", "session_id": root}),
+            self.env, self.data)
+        before = self.state_file()
+        reported_before = len(self.calls())
+        run("session-end", json.dumps({"hook_event_name": "SessionEnd", "session_id": root}),
+            self.env, self.data)
+        self.assertNotIn("pane release-agent", "\n".join(self.calls()))
+        self.assertEqual(len(self.calls()), reported_before)
+        self.assertEqual(self.state_file(), before)
+
+    def test_session_switch_clears_session_identity_without_releasing_pane(self):
+        """clear / archive / resume_other：清会话身份，但 pane 上的 agent 登记留着。
+
+        mcode 换会话时前后是同一个活着的进程，所以归属判活救不了「last_reported 停在
+        working」这个陷阱：新会话的 SessionStart 会被当成子代理吞掉，之后它的钩子全被
+        忽略，pane 就再也接不上新会话了。
+        """
+        old, new = "mvs_root", "mvs_next"
+        run("session-start", json.dumps({"hook_event_name": "SessionStart", "session_id": old}),
+            self.env, self.data)
+        run("user-prompt", json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": old}),
+            self.env, self.data)
+        reported_before = len(self.calls())
+
+        run("session-end", json.dumps({"hook_event_name": "SessionEnd", "session_id": old,
+                                       "reason": "resume_other"}), self.env, self.data)
+        # 一个字节都不许上报：不 release（agent 还该在），也不报 idle（下一轮由新会话报）
+        self.assertEqual(len(self.calls()), reported_before)
+        self.assertNotIn("pane release-agent", "\n".join(self.calls()))
+        state = self.state_file()
+        self.assertIsNone(state["root_session"])
+        self.assertIsNone(state["last_reported"])
+
+        # 新会话必须认领得下来，且是靠它自己的 SessionStart 报出来的 idle
+        run("session-start", json.dumps({"hook_event_name": "SessionStart", "session_id": new}),
+            self.env, self.data)
+        self.assertIn(f"--agent-session-id {new}", self.calls()[-1])
+        self.assertIn("--state idle", self.calls()[-1])
+        self.assertEqual(self.state_file()["root_session"], new)
+        self.assertEqual(self.state_file()["last_reported"], "idle")
+
+    def test_reset_path_stamps_the_owner_too(self):
+        """RESET 也是一次状态写入，漏盖归属就会让下一次读回把它当陈旧丢掉。"""
+        root = "mvs_root"
+        run("session-start", json.dumps({"hook_event_name": "SessionStart", "session_id": root}),
+            self.env, self.data)
+        # 先把归属换成别人那台活着的 mcode：不换的话，状态里本来就写着当前归属，
+        # 「reset 盖了归属」和「reset 没盖」在断言上长得一模一样，这条用例就没有牙齿
+        other, other_start = self._live_pid()
+        self._seed_state(root_session=root, blocked_by=root, last_reported="working",
+                         owner_pid=other, owner_start=other_start)
+        run("session-end", json.dumps({"hook_event_name": "SessionEnd", "session_id": root,
+                                       "reason": "clear"}), self.env, self.data)
+        state = self.state_file()
+        self.assertIsNone(state["root_session"])               # 业务字段确实清了
+        self.assertIsNone(state["blocked_by"])
+        self.assertEqual(state["owner_pid"], self.owner_pid)   # 归属盖成了当前这台
+        self.assertEqual(state["owner_start"], self.owner_start)
 
     def test_hook_detaches_worker_and_returns_immediately(self):
         """真起子进程跑钩子：herdr-report.py → worker.py 这段唯一的自动化覆盖。
@@ -558,8 +662,8 @@ class ReplayTest(unittest.TestCase):
         other, other_start = self._live_pid()
         self._seed_state(root_session=root, last_reported="working",
                          owner_pid=other, owner_start=other_start)
-        run("session-end", json.dumps({"hook_event_name": "SessionEnd", "session_id": root}),
-            self.env, self.data)
+        run("session-end", json.dumps({"hook_event_name": "SessionEnd", "session_id": root,
+                                       "reason": "logout"}), self.env, self.data)
         state = self.state_file()
         self.assertIsNone(state["root_session"])               # release 确实清了业务字段
         self.assertIsNone(state["last_reported"])

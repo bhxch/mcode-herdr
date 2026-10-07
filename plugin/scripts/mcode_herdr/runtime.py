@@ -77,6 +77,15 @@ def run_once(action: str, raw_payload: str, env: Mapping[str, str],
             return
         state.owner_pid = owner_pid
         state.owner_start = owner_start
+        if decision.kind is Decision.Kind.RESET:
+            # 换会话：只清会话身份。不 release —— mcode 进程还活着，pane 上的 agent 登记
+            # 必须留着（这正是本次要修的 bug）；也不上报 —— 接手的新会话会在片刻后用它的
+            # SessionStart 报 idle。此处照样盖归属：这也是一次落盘，漏了归属下一次读回
+            # 就当成陈旧状态丢掉。
+            state.root_session = None
+            state.blocked_by = None
+            state.last_reported = None
+            return
         if decision.kind is Decision.Kind.RELEASE:
             transport.release(herdr_env, transport.next_seq())
             state.root_session = None

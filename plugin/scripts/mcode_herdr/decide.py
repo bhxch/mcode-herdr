@@ -11,6 +11,11 @@
   Stop 同样不代表问题已解决：只要 pane 还记着 blocked_by，就不许翻 idle。
   真正的解障信号是用户作答时重新发出的 UserPromptSubmit（user-prompt 分支）。
 - SessionStart 在 pane 处于 working 时到达 → 必定是子代理创建，忽略。
+- SessionEnd 带顶层 payload.reason，五种取值里只有 logout 表示进程真的退出（→ RELEASE）。
+  idle_timeout 是「turn 早就结束、人走开了」，mcode 还杵在提示符前，一个字节都不许动。
+  clear / archive / resume_other 是同一进程内换了会话：mcode 仍活着，只清会话身份
+  （→ RESET），pane 上的 agent 登记留着，状态由接手的新会话的 SessionStart 报。
+  拿不出来或认不出来的 reason 一律按「不动」处理 —— 看不懂的信号绝不能当退出。
 - 与上次相同的状态不上报，减少噪声（herdr 侧通知本身也按跃迁去重）。
 """
 from __future__ import annotations
@@ -23,6 +28,10 @@ from .payload import Payload
 from .store import PaneState
 
 ASK_USER = "ask_user"
+# SessionEnd 的 payload.reason（mcode 0.6.3 coordinator.ts 的五种取值，见模块 docstring）
+REASON_LOGOUT = "logout"
+# 换会话：mcode 进程还活着，只是 root 已经不是这一个了
+SESSION_SWITCH_REASONS = frozenset({"clear", "archive", "resume_other"})
 
 
 @dataclass(frozen=True)
@@ -34,8 +43,13 @@ class Action:
 class Decision:
     """状态机交给运行时的唯一契约。
 
-    - kind 决定消费方式：REPORT 按 state 改 pane 状态，RELEASE 交还 pane。
-    - state 只对 REPORT 有意义，RELEASE 时为空串。
+    - kind 决定消费方式，三种：
+      REPORT 按 state 改 pane 状态并上报；
+      RELEASE 交还 pane（只有用户真的退出才用）；
+      RESET 只清掉 pane 记住的会话身份（root_session / blocked_by / last_reported），
+      **不**交还 pane、**不**上报 —— agent 登记留在原地，下一轮状态由接手的新会话的
+      SessionStart 报出去（RELEASE 会让 pane 上凭空少掉一个还活着的 agent）。
+    - state 只对 REPORT 有意义，RELEASE / RESET 时为空串。
     - attach_session / resume 只由 session-start 的「认领」路径置位：那是 pane
       第一次学到本次会话的 id，也只有那一刻能拿到恢复命令去 attach。
     - new_root_session 非空时，用它覆盖 store 里已存的 root_session。
@@ -46,6 +60,7 @@ class Decision:
     class Kind(Enum):
         REPORT = "report"
         RELEASE = "release"
+        RESET = "reset"
 
     kind: "Decision.Kind"
     state: str = ""
@@ -119,8 +134,22 @@ def decide(action: Action, payload: Payload, state: PaneState) -> Optional[Decis
 
     if name == "session-end":
         if not root or payload.session_id != root:
-            return None  # 结束的不是当前会话，release 会误清新会话的状态
-        return Decision(kind=Decision.Kind.RELEASE)
+            # 结束的不是当前会话：任何清理（release 更狠，它还会交还 pane）都会误伤
+            # 新会话已经建立起来的这份状态
+            return None
+        reason = payload.session_end_reason
+        if reason == REASON_LOGOUT:
+            return Decision(kind=Decision.Kind.RELEASE)
+        if reason in SESSION_SWITCH_REASONS:
+            return Decision(kind=Decision.Kind.RESET)
+        # idle_timeout：turn 早就结束、人走开了，mcode 还活着、会话也没换，一个字节都不动。
+        # 这里动状态反而有害：清掉 root_session 的话，用户回来敲的第一条 UserPromptSubmit
+        # 会因为认不出会话被忽略，pane 要静默到某个无关的 SessionStart 为止。
+        #
+        # reason 缺失（早于该字段的 mcode）或认不出来时同样走这里：看不懂的信号绝不能当
+        # 退出处理，否则任何非退出事件都会把 agent 从 pane 上摘掉。保守的代价有界 ——
+        # 真退出时 herdr 自己的「agent 进程没了」安全网会在一两秒后收掉它。
+        return None
 
     return None
 

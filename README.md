@@ -474,7 +474,7 @@ SystemRoot ComSpec USERPROFILE HOMEDRIVE HOMEPATH APPDATA LOCALAPPDATA
 | `stop` | 会话 != `root_session` | 忽略 |
 | `stop` | `blocked_by` 非空 | 忽略（turn 结束 ≠ 问题解决） |
 | `stop` | 否则 | 上报 `idle` |
-| `session-end` | `reason == "logout"` | `release-agent` 交还 pane，并清空该 pane 的状态 |
+| `session-end` | `reason == "logout"`（账号登出） | `release-agent` 交还 pane，并清空该 pane 的状态 |
 | `session-end` | `reason` 是 `clear` / `resume`（换会话） | 只清会话归属，**不** release；新会话自己的 `SessionStart` 会重新认领 |
 | `session-end` | `reason` 是 `other`（= 归档或空闲超时），或缺失/认不出 | **完全不动** |
 
@@ -485,7 +485,7 @@ SystemRoot ComSpec USERPROFILE HOMEDRIVE HOMEPATH APPDATA LOCALAPPDATA
 
 | 内部取值 | 线上 `payload.reason` | mcode 还在跑吗 | 触发时机 |
 |---|---|---|---|
-| `logout` | `logout` | 否 | 用户退出 |
+| `logout` | `logout` | **是**（停在登录提示符） | 用户执行 `/logout`，账号被登出 |
 | `clear` | `clear` | **是** | 用户执行 `/clear` |
 | `resume_other` | `resume` | **是** | 同一进程内从会话 A 切到会话 B |
 | `archive` | **`other`** | **是** | 对话被归档 |
@@ -493,7 +493,19 @@ SystemRoot ComSpec USERPROFILE HOMEDRIVE HOMEPATH APPDATA LOCALAPPDATA
 
 三个要点：
 
-- **只有 `logout` 原样上线且意味着「用户真的退出了」**，所以只有它才 release；
+- **`logout` 的含义是「账号登出」，不是「进程退出了」**。0.6.3 里
+  `createRuntimePluginAuthContextNotifier`
+  （`packages/local-runtime-v2/src/application/session/runtime-services-lifecycle.ts:88-100`）
+  只在 `authState === "logged_out"` 时发 `endAllSessionsForLogout`，而 `logged_out` 的唯一
+  来源是 `/logout` 命令流（`packages/tui/src/tui/controller/product/command-flow.ts:1729-1733`）
+  —— 那条分支只调 `refreshAccountStatusNow()`，**不退出**；只有 `/login` 分支才有
+  `requestRestart` + `leaveUi`（`command-flow.ts:1707-1714`）。进程真正退出走的是
+  `coordinator.dispose()`，它**不发任何钩子**。也就是说：本插件**永远看不到进程退出信号**。
+  尽管如此 `logout` 仍然 release，这是有意的取舍 —— 登出后的 mcode 干不了活，让它在面板上
+  继续显示 `idle`／「可以输入了」本身就是撒谎；代价有界（只在登出期间 pane 上没有 agent），
+  重新登录会发一次全新的 `SessionStart` 重新认领。也不存在「另一个窗口登出把这边健康会话
+  释放掉」：`notifyAuthContextChanged` 是从本地命令流经 `launcher.ts:433`（`activeRuntime.host`）
+  接到 local runtime 的，跨不到别的窗口；
 - **空闲超时上线后是 `other`，不是 `idle_timeout`**。这不是读源码推断的：把 mcode 的空闲
   定时器从 30 分钟缩到 20 秒跑一次真机会话，抓到的真实 `SessionEnd` 就是 `reason='other'`
   —— 早期实现照抄内部联合类型去匹配 `idle_timeout`，那个分支在线上从未被触发过；
@@ -506,6 +518,10 @@ herdr 文档也这么要求：
 > Only release when the user actually quits. If your agent replaces one session with another in the same process, report the new session instead of releasing.
 
 若对 `SessionEnd` 无条件 release，**空闲 30 分钟后 agent 就会从面板上消失，而 mcode 还坐在输入框前等着** —— 这是本插件实测踩过的坑。所以只有 `logout` 才 release。
+**进程真的退出这条根本不靠钩子**：退出走 `coordinator.dispose()`，它不发任何事件，靠的是
+herdr 自己的「agent 进程没了」安全网（`available_pane_shell_from_job`，
+herdr `src/platform/mod.rs:409`：有非 shell 进程占据前台时它返回 `None`，所以活着的 mcode
+自己就能保护住 pane，它一消失 herdr 会在一两秒内清掉）。
 
 换会话那两种线上取值（`clear` / `resume`）必须清掉会话归属：若把 `last_reported` 留在
 `working`，紧接着的 `SessionStart` 会撞上「`working` ⇒ 必然是子代理」那条守卫被吞掉，新会话
@@ -518,7 +534,7 @@ herdr 文档也这么要求：
 更保守的处理 —— 把 `other` 当换会话的 RESET，会以更隐蔽的形式复现同一个故障。
 
 `reason` 缺失或认不出时按「不动」处理：看不懂的信号绝不能当退出处理，而保守的代价有界 ——
-真退出时 herdr 自己的「agent 进程没了」安全网会在一两秒后收掉它。
+进程真退出时 herdr 自己的「agent 进程没了」安全网会在一两秒后收掉它。
 
 **「怎么知道 pane 被卡住了」的真机依据**（mcode 0.6.3，交互式会话，11 个钩子事件全订阅）：
 这类工具**不阻塞**这次工具调用 —— `ask_user` 在 `PreToolUse` 之后约 33ms 就带着

@@ -391,7 +391,9 @@ class ReplayTest(unittest.TestCase):
         真机会话，抓到的真实 SessionEnd 就是 reason='other'，不是 'idle_timeout'。
 
         两个 reason 跑在同一份状态上，构成直接对照：other 必须既不调 release-agent 也不改
-        状态，logout 必须调。
+        状态，logout 必须调。注意 logout 的含义是**账号登出**而不是「进程退出了」
+        （见 decide.py 的 REASON_LOGOUT 注释），它之所以仍然 release，是因为登出后的
+        mcode 干不了活 —— 拿 herdr 那句「真的退出」来理解它会得出错误的理由。
         """
         root = "mvs_root"
         for action, extra in (("session-start", {"source": "startup"}),

@@ -5,9 +5,15 @@
 避免下游到处判空，也避免带空白的 id 被原样拼进 mcode 恢复命令。
 
 布尔标记同理只认真布尔值：waiting_for_user 取自
-tool_response.details.waiting_for_user，是 ask_user 问卷是否仍在等人回答的权威信号
-（实测 ask_user 立刻带 terminate=true + waiting_for_user=true 返回，问卷还开着），
+tool_response.details.waiting_for_user，是「这个人还在等回答吗」的权威信号，
+与工具叫什么无关 —— mcode 0.6.3 里 ask_user / ExitPlanMode / request_feature_enable
+三个会阻塞人的工具全都带这个字段（实测 bundle：三者都是 waiting_for_user=true +
+terminate=true），所以解析层与状态机都不需要认识工具名。
 缺失、null 或任何非布尔取值一律归一为 False，绝不抛。
+
+stop_hook_active 只解析不使用：它是 stopHookActive: state.active（coordinator.ts:425），
+只有 Stop 钩子已经拦截过一次（用来防止钩子死循环）时才为真。本插件从不拦截 Stop，
+所以它在线上恒为 false —— 是无用的死字段，不是漏掉的信号。留着它是因为它确实在线上。
 
 只有 SessionEnd 带 reason，取自**顶层** payload.reason（不埋在 tool_response 里），
 它是「这次结束到底发生了什么」的权威信号。走同一套 _text 宽容归一：非字符串、缺失、
@@ -16,8 +22,8 @@ tool_response.details.waiting_for_user，是 ask_user 问卷是否仍在等人�
 注意这里收到的是**线上取值，不是 mcode 内部的联合类型**。内部
 archive 与 idle_timeout 在上线前会被 compatibleSessionEndReason（runner.ts）
 合并成 other，resume_other 被改写成 resume。所以线上的取值只有：
-logout（唯一表示进程真的退出）、clear、resume、other。想看内部语义得读 TS 源码，
-不能直接把那个 union 当线格式抄过来。
+logout（含义是**账号登出**，不是进程退出）、clear、resume、other。想看内部语义得读
+TS 源码，不能直接把那个 union 当线格式抄过来。
 """
 from __future__ import annotations
 
@@ -35,6 +41,7 @@ class Payload:
     agent_type: Optional[str]
     source: Optional[str]
     cwd: Optional[str]
+    # 解析但从不读取：本插件不拦截 Stop，所以它线上恒为 false（见模块 docstring）
     stop_hook_active: bool
     waiting_for_user: bool = False
     # SessionEnd 的顶层 payload.reason；非 SessionEnd 事件恒为 None，见模块 docstring
@@ -50,7 +57,7 @@ def _text(value: Any) -> Optional[str]:
 def _waiting_for_user(data: dict) -> bool:
     """取 tool_response.details.waiting_for_user，逐层缺失/null 都退化成 False。
 
-    逐层 isinstance 是为了容忍线上真实存在的几种形态：老版本 ask_user 根本不回
+    逐层 isinstance 是为了容忍线上真实存在的几种形态：老版本工具根本不回
     tool_response、tool_response 里没有 details、details 为 null。任何一层不合预期
     都只意味着「没证据说还在等」，此时按 False 走原有的清障路径，不会静默卡死在 blocked。
     """

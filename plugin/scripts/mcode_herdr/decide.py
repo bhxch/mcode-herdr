@@ -19,7 +19,8 @@
   真正的解障信号是用户作答时重新发出的 UserPromptSubmit（user-prompt 分支）。
 - SessionStart 在 pane 处于 working 时到达 → 必定是子代理创建，忽略。
 - SessionEnd 带顶层 payload.reason，且钩子读到的是**改写后**的线上取值，不是 mcode 内部的
-  联合类型（映射见下方常量处的注释）。线上只有 logout 意味着进程真的退出（→ RELEASE）。
+  联合类型（映射见下方常量处的注释）。线上 logout 表示**账号登出**：mcode 还活着，
+  停在登录提示符，但它干不了活，所以照样 RELEASE（理由见 REASON_LOGOUT 处的注释）。
   线上 other 是内部 archive 与 idle_timeout 的合流值：空闲超时是「turn 早就结束、人走开了」，
   mcode 还杵在提示符前，一个字节都不许动；而它与 archive 在线上一模一样，分不出来，
   所以 other 只能走「不动」，绝不能当换会话。线上 clear / resume 是同一进程内换了会话：
@@ -51,7 +52,26 @@ from .store import PaneState
 # 这张表不是读源码推断的：把 mcode 的空闲定时器从 30 分钟缩到 20 秒跑了一次真机会话，
 # 抓到的真实 SessionEnd 是 reason='other'（内部的 idle_timeout 从不上线）。
 # 换句话说，在本文件里匹配 reason 时**只能**用右边一列；用左边那列去匹配等于写死代码。
-REASON_LOGOUT = "logout"  # 唯一原样上线、且意味着进程真的退出的取值
+#
+# logout 的语义是**账号登出**，不是「进程退出了」：0.6.3 里
+# createRuntimePluginAuthContextNotifier（packages/local-runtime-v2/src/application/
+# session/runtime-services-lifecycle.ts:88-100）只在 authState === "logged_out" 时发
+# endAllSessionsForLogout，而 logged_out 的唯一来源是 /logout 命令流
+# （packages/tui/src/tui/controller/product/command-flow.ts:1729-1733）—— 那条分支只调
+# refreshAccountStatusNow()，**不退出**；只有 /login 分支才有 requestRestart + leaveUi
+# （command-flow.ts:1707-1714）。进程退出走的是 coordinator.dispose()，它不发任何钩子。
+#
+# 仍然 release 是有意的取舍：账号登出后的 mcode 干不了活，让它在面板上继续显示
+# idle /「可以输入了」本身就是撒谎 —— 而「撒谎」正是本插件最不能犯的错。代价有界：
+# 只在登出期间 pane 上看不到 agent，重新登录会发一次全新的 SessionStart 重新认领
+# （clear 那条路的回放测试已端到端验证过重新认领会发生）。
+# 这条决策不依赖「进程真的退了」那个前提：进程退出根本不走这里，靠的是 herdr 自己的
+# 安全网 —— available_pane_shell_from_job（herdr src/platform/mod.rs:409）在有非 shell
+# 进程占据前台时返回 None，所以活着的 mcode 会自己保护住 pane，而它一消失，
+# herdr 会在一两秒内清掉 agent。
+# 也不存在「另一个窗口登出把这边健康会话释放掉」：notifyAuthContextChanged 是从本地
+# 命令流经 launcher.ts:433（activeRuntime.host）接到 local runtime 的，跨不到别的窗口。
+REASON_LOGOUT = "logout"  # 线上原样上线的取值，含义是账号登出
 # 换会话：mcode 进程还活着，只是 root 已经不是这一个了。clear 原样上线，resume 来自内部的
 # resume_other。
 #
@@ -73,7 +93,7 @@ class Decision:
 
     - kind 决定消费方式，三种：
       REPORT 按 state 改 pane 状态并上报；
-      RELEASE 交还 pane（只有用户真的退出才用）；
+      RELEASE 交还 pane（只在 reason == logout 即账号登出时用；见 REASON_LOGOUT 处的注释）；
       RESET 只清掉 pane 记住的会话身份（root_session / blocked_by / last_reported），
       **不**交还 pane、**不**上报 —— agent 登记留在原地，下一轮状态由接手的新会话的
       SessionStart 报出去（RELEASE 会让 pane 上凭空少掉一个还活着的 agent）。
@@ -180,8 +200,8 @@ def decide(action: Action, payload: Payload, state: PaneState) -> Optional[Decis
         #
         # reason 缺失（早于该字段的 mcode）、内部取值（archive / idle_timeout / resume_other
         # 不会上线）或认不出来时同样走这里：看不懂的信号绝不能当退出处理，否则任何非退出事件
-        # 都会把 agent 从 pane 上摘掉。保守的代价有界 —— 真退出时 herdr 自己的「agent 进程没了」
-        # 安全网会在一两秒后收掉它。
+        # 都会把 agent 从 pane 上摘掉。保守的代价有界 —— 进程真的退出时 herdr 自己的
+        # 「agent 进程没了」安全网会在一两秒后收掉它（见 REASON_LOGOUT 处的注释）。
         return None
 
     return None

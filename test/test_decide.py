@@ -220,10 +220,20 @@ class DecideTest(unittest.TestCase):
         self.assertIsNone(decide(Action("stop"), p("Stop", session_id=CHILD), st))
 
     def test_session_end_logout_releases_current_root(self):
-        """唯一原样上线的 reason：logout 表示进程真的退了。
+        """账号登出（`/logout`）释放 pane。
 
-        线上 reason 取自 mcode 的 compatibleSessionEndReason（runner.ts）在序列化前的改写结果，
-        五个内部取值里只有 logout 和 clear 原样通过；logout 这一个才意味着进程真的退出。
+        reason 取自 mcode 的 compatibleSessionEndReason（runner.ts）在序列化前的改写结果。
+        注意 logout 的语义**不是**「进程退出了」：0.6.3 里
+        createRuntimePluginAuthContextNotifier（runtime-services-lifecycle.ts:88-100）
+        只在 authState === "logged_out" 时发 endAllSessionsForLogout，而 logged_out
+        的唯一来源是 /logout 命令流（command-flow.ts:1729-1733）—— 那条分支只调
+        refreshAccountStatusNow()，不退出；只有 /login 分支才有 requestRestart +
+        leaveUi（command-flow.ts:1707-1714）。进程退出走的是 coordinator.dispose()，
+        它不发任何钩子。所以 logout = **账号登出、mcode 还活着停在登录提示符**。
+
+        仍然 release 是有意的：登出后的 mcode 干不了活，让它在面板上继续显示
+        idle/「可以输入了」本身就是撒谎。代价有界（只在登出期间 pane 上没有 agent），
+        重新登录会发一次全新的 SessionStart 重新认领。
         """
         d = decide(Action("session-end"), p("SessionEnd", session_end_reason="logout"),
                    PaneState(root_session=ROOT))

@@ -349,15 +349,21 @@ plugin/scripts/herdr-report.py ── 读 stdin → 回溯 HERDR_* → Popen(sta
 
 事件名是**显式传参**的，脚本不靠载荷里的 `hook_event_name` 做路由，所以载荷字段改名不影响分发。
 
-**会停住 turn、把人卡住的工具不止一个。** mcode 0.6.3 里有三个，在**已安装的 bundle**
-（`~/.minimax-code/releases/0.6.3/`，不是源码树）里逐个确认过，返回的都是
+**会停住 turn、把人卡住的工具不止一个。** mcode 0.6.3 里有三个，返回的都是
 `details.waiting_for_user: true` + `terminate: true`：
 
-| 工具 | 什么时候用 | 它停下来等什么 |
-| --- | --- | --- |
-| `ask_user` | agent 要问用户 | 问卷（`packages/agent-tools/src/desktop/local-ask-user.ts:46`） |
-| `ExitPlanMode` | 计划模式 | 对计划的批准（`packages/agent-extension/src/plan-mode.ts:249-255`） |
-| `request_feature_enable` | 功能开关 | 开不开某个功能（`packages/agent-tools/src/desktop/local-feature-enable.ts:37-46`） |
+| 工具 | 什么时候用 | 它停下来等什么 | 证据 |
+| --- | --- | --- | --- |
+| `ask_user` | agent 要问用户 | 问卷（`packages/agent-tools/src/desktop/local-ask-user.ts:46`） | **真机抓包** |
+| `ExitPlanMode` | 计划模式 | 对计划的批准（`packages/agent-extension/src/plan-mode.ts:249-255`） | **真机抓包** |
+| `request_feature_enable` | 功能开关 | 开不开某个功能（`packages/agent-tools/src/desktop/local-feature-enable.ts:37-46`） | bundle 推导¹ |
+
+工具名与字段都在**已安装的 bundle**（`~/.minimax-code/releases/0.6.3/`，不是源码树）里
+核对过 —— 这个区分很重要：本项目有一次 bug 正是因为照着源码里的类型定义写，而线上值
+经过了一层改写（见[§4.6](#46-状态机只在状态变化时上报)的 `SessionEnd.reason`）。
+
+> ¹ `request_feature_enable` 需要弹功能开关卡片，无头环境触发不了，所以只有 bundle 证据。
+> 它和另外两个同源（同一套 `waiting_for_user` + `terminate`），风险不高。
 
 **漏掉任何一个，失败方式都是静默的**：mcode 根本不触发钩子，人正对着批准卡片发呆，
 pane 却一直显示 `working`，既不通知也等不到。早先只挂了 `ask_user`，计划模式和功能开关
@@ -769,15 +775,23 @@ cat "${MINIMAX_DATA_DIR:-$HOME/.minimax}"/v2/plugin-data/hooks/mcode-herdr/w4_p3
 
 离线回放，**完全不涉及 herdr 与 mcode**，也不需要网络：喂真实的钩子载荷样本
 （`test/fixtures/`，每个样本的来源见 `test/fixtures/README.md`），用假 herdr 二进制
-逐条记录 argv / socket 请求，再断言调用序列与状态流转。当前 **146 个用例全绿**。
-样本里从未实时抓到的只有子代理工具事件（按 mcode 的字段契约构造）和计划模式批准
-那条阻塞链（按**已安装的 0.6.3 bundle** 的实际返回构造）—— 字段名变更风险未被真实
-抓包覆盖；而且如第 5 节所述，mcode 0.6.3 的子代理根本调不到那类工具，子代理路径的
-构造动机有限。
+逐条记录 argv / socket 请求，再断言调用序列与状态流转。当前 **145 个用例全绿**。
+
+样本的来源分三档，别把它们当成同等的证据强度：
+
+- **真机抓包**：`ask_user` 问卷那一条阻塞链（`PreToolUse` → `PostToolUse` 带
+  `waiting_for_user` → `Stop`）以及计划模式批准那条（`ExitPlanMode`）。两条都是在真实
+  mcode 0.6.3 会话里逐事件抓到的。
+- **从已安装 bundle 推导**：`request_feature_enable` 的阻塞返回。本机 0.6.3 的 bundle 里
+  确认了 `details.waiting_for_user: true` + `terminate: true`，但没能真机触发它（需要弹
+  功能开关卡片），字段名变更风险未被真实流量覆盖。
+- **按字段契约构造**：子代理的工具事件（见[§9.6](#96-子代理目前调不到-ask_user)）——
+  mcode 0.6.3 的子代理根本没有这些工具，所以构造动机有限。
 
 **验证状态说明**：本仓库自带的是离线回放测试。端到端（在真实 herdr pane 里跑 mcode、
-断言 `herdr agent list` 出现 mcode 并正确流转、herdr server 重启后会话恢复）
-目前**没有**自动化测试，装好插件后需要手工验证一次。
+断言 `herdr agent list` 出现 mcode 并正确流转）目前**没有**自动化测试，本项目的开发过程
+是靠手工在真实 pane 里验的：正常流转、`ask_user` 与 `ExitPlanMode` 两条阻塞链、30 分钟
+空闲超时、`/new` 与会话切换引起的 `SessionEnd`。装好插件后建议自己手工过一遍。
 
 ---
 
@@ -872,7 +886,11 @@ mcode 0.6.3 的 `explore` / `mavis` 两种子代理都没有 `ask_user` 工具�
 │       └── mcode_herdr/*.py
 ├── test/
 │   ├── run-tests.sh               # ./test/run-tests.sh
-│   ├── fixtures/*.json            # 真实载荷样本，来源见 fixtures/README.md
+│   ├── fixtures/*.json            # 载荷样本，来源分档见 fixtures/README.md
+│   ├── test_hooks_config.py       # 守住「工具名只存在于 hooks.json」
+│   ├── test_env.py  test_payload.py  test_store.py  test_decide.py
+│   ├── test_transport.py          # 双通道上报与 seq 语义
+│   └── test_replay.py             # 子进程级端到端回放，喂 fixtures/ 里的样本
 │   └── test_*.py
 ├── probe/                         # 一次性探针插件（herdr-probe）：把钩子收到的 stdin
 │   └── scripts/dump.sh            # 与 /proc 父链原样落盘。用来确定 mcode 的载荷字段名。

@@ -84,9 +84,13 @@ class PayloadTest(unittest.TestCase):
                 self.assertIsNone(p.session_end_reason)
 
     def test_session_end_reason_is_stripped(self):
-        # 带空白的 reason 要归一掉，否则精确匹配 reason 的分流会全部落空
-        p = load_payload('{"hook_event_name":"SessionEnd","reason":"  idle_timeout  "}')
-        self.assertEqual(p.session_end_reason, "idle_timeout")
+        # 带空白的 reason 要归一掉，否则精确匹配 reason 的分流会全部落空。
+        # 取值用真正上线的字符串（见 mcode runner.ts 的 compatibleSessionEndReason）：
+        # other = 内部 archive / idle_timeout 合流后的线上值，logout 原样上线
+        for raw, expected in (('"  other  "', "other"), ('"  logout  "', "logout")):
+            with self.subTest(reason=raw):
+                p = load_payload(f'{{"hook_event_name":"SessionEnd","reason":{raw}}}')
+                self.assertEqual(p.session_end_reason, expected)
 
     def test_session_end_reason_is_absent_on_other_events(self):
         # 其余事件不带 reason，解析不能凭空造一个出来

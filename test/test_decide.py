@@ -153,7 +153,11 @@ class DecideTest(unittest.TestCase):
         self.assertIsNone(decide(Action("stop"), p("Stop", session_id=CHILD), st))
 
     def test_session_end_logout_releases_current_root(self):
-        """五种 reason 里只有 logout 表示进程真的退了，其余四种 mcode 都还在跑。"""
+        """唯一原样上线的 reason：logout 表示进程真的退了。
+
+        线上 reason 取自 mcode 的 compatibleSessionEndReason（runner.ts）在序列化前的改写结果，
+        五个内部取值里只有 logout 和 clear 原样通过；logout 这一个才意味着进程真的退出。
+        """
         d = decide(Action("session-end"), p("SessionEnd", session_end_reason="logout"),
                    PaneState(root_session=ROOT))
         self.assertEqual(d.kind, Decision.Kind.RELEASE)
@@ -168,27 +172,58 @@ class DecideTest(unittest.TestCase):
                                  p("SessionEnd", session_id=CHILD, session_end_reason="logout"),
                                  PaneState(root_session=ROOT)))
 
-    def test_session_end_idle_timeout_is_a_complete_no_op(self):
-        """P0 回归：turn 结束 30 分钟后 mcode 会发 SessionEnd(idle_timeout)，进程还活着。
+    def test_session_end_wire_other_is_a_complete_no_op(self):
+        """P0 回归：空闲超时的**线上取值**是 'other'，它必须一个字节都不动。
 
-        原实现对一切 SessionEnd 都 release，于是空闲半小时后 pane 里的 agent 无故消失，
-        而 mcode 还杵在提示符前 —— herdr 自己的规矩是「只有用户真的退出才交还 pane」。
-        这里一个字节都不许动：root_session 一旦被清，用户回来敲的第一条 UserPromptSubmit
-        会因为认不出会话而被状态机忽略，pane 要一直静默到某个无关的 SessionStart 为止。
+        线上取值来自 mcode 的 compatibleSessionEndReason（runner.ts）：内部的 idle_timeout
+        在序列化前就被改写成 other，所以钩子读到的 reason 是 'other'，不是 'idle_timeout'。
+        曾把 mcode 的空闲定时器从 30 分钟缩到 20 秒跑真机会话，抓到的真实 SessionEnd 就是
+        reason='other' —— 这是实测，不是读源码推断。
+
+        这里要挡的是「把 other 当换会话处理」这种更隐蔽的回归：内部的 archive 与
+        idle_timeout 在线上合流成同一个 other，状态机分不出二者，而空闲超时的那一方
+        必须完全不动，所以 other 只能走 no-op。
         """
-        st = PaneState(root_session=ROOT, last_reported="idle")
-        self.assertIsNone(decide(Action("session-end"),
-                                 p("SessionEnd", session_end_reason="idle_timeout"), st))
+        st = PaneState(root_session=ROOT, blocked_by=ROOT, last_reported="working")
+        d = decide(Action("session-end"), p("SessionEnd", session_end_reason="other"), st)
+        # 必须是 None：既不是 RESET（会抹掉 root_session，让用户回来敲的第一条
+        # UserPromptSubmit 被忽略），也不是 RELEASE（agent 会从 pane 上凭空消失）
+        self.assertIsNone(d)
+        # decide 是纯函数，这里顺带钉住「输入状态不被就地改动」
+        self.assertEqual(st.root_session, ROOT)
+        self.assertEqual(st.blocked_by, ROOT)
+        self.assertEqual(st.last_reported, "working")
+
+    def test_session_end_internal_union_values_are_not_wire_values(self):
+        """mcode 内部联合类型的三个取值永远不会上线，状态机必须把它们当认不出来处理。
+
+        compatibleSessionEndReason（runner.ts）把 resume_other 改成 resume、把 archive 与
+        idle_timeout 改成 other，只有 logout / clear 原样通过。钩子读到的是改写后的值，
+        所以拿内部取值去匹配 reason 等于写了永不执行的分支 —— 之前的实现正是如此，
+        换会话的 RESET 路径在线上从未被触发过。
+
+        这条用例把「内部取值 ≠ 线上取值」钉死：哪天 mcode 若改成原样下发，本用例会失败，
+        提醒重新实测而不是默默继续匹配失效的字符串。
+        """
+        for reason in ("archive", "idle_timeout", "resume_other"):
+            with self.subTest(reason=reason):
+                d = decide(Action("session-end"), p("SessionEnd", session_end_reason=reason),
+                           PaneState(root_session=ROOT, last_reported="working"))
+                self.assertIsNone(d)
 
     def test_session_end_session_switch_resets_without_releasing(self):
-        """clear / archive / resume_other：进程还在，但会话已经换了。
+        """线上取值 clear / resume：进程还在，但会话已经换了。
 
         要清的是**会话身份**，不是 pane 上的 agent 登记：留着 last_reported="working" 的话，
         紧接着到来的新会话 SessionStart 会命中「working ⇒ 必然是子代理」被吞掉，新会话
         永远认领不了这个 pane，之后它的钩子全部被忽略。归属判活在这里救不了 —— 换会话的
         前后是**同一个**活着的进程。
+
+        两个取值都是 compatibleSessionEndReason（runner.ts）改写后真正上线的字符串：
+        clear 原样通过（用户执行 /clear），resume 来自内部的 resume_other（同一进程内从
+        会话 A 切到 B）。archive 被改写成 other，故不在这一组里。
         """
-        for reason in ("clear", "archive", "resume_other"):
+        for reason in ("clear", "resume"):
             with self.subTest(reason=reason):
                 st = PaneState(root_session=ROOT, blocked_by=ROOT, last_reported="working")
                 d = decide(Action("session-end"), p("SessionEnd", session_end_reason=reason), st)
@@ -199,7 +234,7 @@ class DecideTest(unittest.TestCase):
     def test_session_start_after_a_session_switch_is_not_swallowed(self):
         """换会话之后的新 SessionStart 必须真的认领得下来（上面那个 working 陷阱的正解）。"""
         st = PaneState(root_session=ROOT, last_reported="working")
-        reset = decide(Action("session-end"), p("SessionEnd", session_end_reason="resume_other"), st)
+        reset = decide(Action("session-end"), p("SessionEnd", session_end_reason="resume"), st)
         self.assertEqual(reset.kind, Decision.Kind.RESET)
         # 运行时按 RESET 清空这三个字段后，新会话的 SessionStart 走的就是这条路径
         st.root_session = None

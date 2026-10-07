@@ -339,13 +339,17 @@ class ReplayTest(unittest.TestCase):
         """P0 回归：同为 SessionEnd，空闲超时绝不能把 agent 从 pane 上摘掉。
 
         herdr 的规矩是「只有用户真的退出才交还 pane；同进程内换了会话就报新会话而不是
-        release」。mcode 的 SESSION_IDLE_MS 是 30 分钟，一轮对话结束半小时后它就会发
-        SessionEnd(idle_timeout)，此时进程还在、提示符还杵在那儿。原来的「一切 SessionEnd
-        都 release」让 agent 无故消失 —— 而 herdr 自己的「进程没了就清 agent」安全网在
-        这里根本不会触发（pane 的前台进程组里有活着的 mcode）。
+        release」。mcode 的空闲定时器是 30 分钟，一轮对话结束半小时后它就会发
+        SessionEnd，此时进程还在、提示符还杵在那儿。原来的「一切 SessionEnd 都 release」
+        让 agent 无故消失 —— 而 herdr 自己的「进程没了就清 agent」安全网在这里根本不会
+        触发（pane 的前台进程组里有活着的 mcode）。
 
-        两个 reason 跑在同一份状态上，构成直接对照：idle_timeout 必须既不调
-        release-agent 也不改状态，logout 必须调。
+        这里喂的是真正的**线上取值** other：mcode 的 compatibleSessionEndReason（runner.ts）
+        在序列化前把内部的 idle_timeout 改写成 other。曾把空闲定时器从 30 分钟缩到 20 秒跑
+        真机会话，抓到的真实 SessionEnd 就是 reason='other'，不是 'idle_timeout'。
+
+        两个 reason 跑在同一份状态上，构成直接对照：other 必须既不调 release-agent 也不改
+        状态，logout 必须调。
         """
         root = "mvs_root"
         for action, extra in (("session-start", {"source": "startup"}),
@@ -360,7 +364,7 @@ class ReplayTest(unittest.TestCase):
         reported_before = len(self.calls())
 
         run("session-end", json.dumps({"hook_event_name": "SessionEnd", "session_id": root,
-                                       "reason": "idle_timeout"}), self.env, self.data)
+                                       "reason": "other"}), self.env, self.data)
         self.assertEqual(len(self.calls()), reported_before)
         self.assertNotIn("pane release-agent", "\n".join(self.calls()))
         # 状态必须原封不动：清掉 root_session 的话，用户回来敲的第一条 UserPromptSubmit
@@ -391,11 +395,14 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(self.state_file(), before)
 
     def test_session_switch_clears_session_identity_without_releasing_pane(self):
-        """clear / archive / resume_other：清会话身份，但 pane 上的 agent 登记留着。
+        """线上取值 resume（原样 clear 同理）：清会话身份，但 pane 上的 agent 登记留着。
 
         mcode 换会话时前后是同一个活着的进程，所以归属判活救不了「last_reported 停在
         working」这个陷阱：新会话的 SessionStart 会被当成子代理吞掉，之后它的钩子全被
         忽略，pane 就再也接不上新会话了。
+
+        reason 用 resume 而不是内部的 resume_other：compatibleSessionEndReason（runner.ts）
+        在序列化前就把 resume_other 改写成 resume，钩子读到的是后者。
         """
         old, new = "mvs_root", "mvs_next"
         run("session-start", json.dumps({"hook_event_name": "SessionStart", "session_id": old}),
@@ -405,7 +412,7 @@ class ReplayTest(unittest.TestCase):
         reported_before = len(self.calls())
 
         run("session-end", json.dumps({"hook_event_name": "SessionEnd", "session_id": old,
-                                       "reason": "resume_other"}), self.env, self.data)
+                                       "reason": "resume"}), self.env, self.data)
         # 一个字节都不许上报：不 release（agent 还该在），也不报 idle（下一轮由新会话报）
         self.assertEqual(len(self.calls()), reported_before)
         self.assertNotIn("pane release-agent", "\n".join(self.calls()))

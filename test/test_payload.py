@@ -64,6 +64,34 @@ class PayloadTest(unittest.TestCase):
                                  f'"tool_response":{{"details":{{"waiting_for_user":{value}}}}}}}')
                 self.assertFalse(p.waiting_for_user)
 
+    def test_session_end_reason_is_parsed_from_top_level_payload(self):
+        """reason 是**顶层**字段，不像 waiting_for_user 那样埋在 tool_response.details 里。"""
+        p = load_payload('{"hook_event_name":"SessionEnd","session_id":"mvs_x","reason":"logout"}')
+        self.assertEqual(p.session_end_reason, "logout")
+        self.assertEqual(p.session_id, "mvs_x")
+
+    def test_session_end_reason_defaults_to_none(self):
+        p = load_payload('{"hook_event_name":"SessionEnd","session_id":"mvs_x"}')
+        self.assertIsNone(p.session_end_reason)
+
+    def test_session_end_reason_blank_or_non_string_is_none(self):
+        # 空白、非字符串、null 一律 None 且绝不抛：钩子抛异常等于整个插件静默失效。
+        # 大小写不在这里管：'LOGOUT' 是合法字符串，只是不匹配 decide 里的 'logout'，
+        # 那属于「认不出来的 reason 不许 release」，在 test_decide 里覆盖。
+        for raw in ('"   "', "null", "7", "true", '["logout"]', '{"kind":"logout"}'):
+            with self.subTest(reason=raw):
+                p = load_payload(f'{{"hook_event_name":"SessionEnd","reason":{raw}}}')
+                self.assertIsNone(p.session_end_reason)
+
+    def test_session_end_reason_is_stripped(self):
+        # 带空白的 reason 要归一掉，否则精确匹配 reason 的分流会全部落空
+        p = load_payload('{"hook_event_name":"SessionEnd","reason":"  idle_timeout  "}')
+        self.assertEqual(p.session_end_reason, "idle_timeout")
+
+    def test_session_end_reason_is_absent_on_other_events(self):
+        # 其余事件不带 reason，解析不能凭空造一个出来
+        self.assertIsNone(fixture("stop.json").session_end_reason)
+
     def test_stop_fields(self):
         p = fixture("stop.json")
         self.assertEqual(p.event, "Stop")

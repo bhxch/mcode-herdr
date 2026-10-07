@@ -8,6 +8,11 @@
 tool_response.details.waiting_for_user，是 ask_user 问卷是否仍在等人回答的权威信号
 （实测 ask_user 立刻带 terminate=true + waiting_for_user=true 返回，问卷还开着），
 缺失、null 或任何非布尔取值一律归一为 False，绝不抛。
+
+只有 SessionEnd 带 reason，取自**顶层** payload.reason（不埋在 tool_response 里），
+它是「这次结束到底发生了什么」的权威信号：五种取值里只有 logout 表示进程真的退出，
+idle_timeout / clear / archive / resume_other 时 mcode 都还在跑。走同一套 _text 宽容
+归一：非字符串、缺失、纯空白一律 None，绝不抛。
 """
 from __future__ import annotations
 
@@ -27,6 +32,8 @@ class Payload:
     cwd: Optional[str]
     stop_hook_active: bool
     waiting_for_user: bool = False
+    # SessionEnd 的顶层 payload.reason；非 SessionEnd 事件恒为 None，见模块 docstring
+    session_end_reason: Optional[str] = None
 
 
 def _text(value: Any) -> Optional[str]:
@@ -72,4 +79,5 @@ def load_payload(raw: str) -> Payload:
         cwd=_text(data.get("cwd")),
         stop_hook_active=bool(data.get("stop_hook_active")),
         waiting_for_user=_waiting_for_user(data),
+        session_end_reason=_text(data.get("reason")),
     )

@@ -251,7 +251,7 @@ blocked 一直挂到人作答为止，才被作答触发的那次 `UserPromptSub
 
 | 钩子 | 根会话动作 | 子代理动作 |
 |------|-----------|-----------|
-| `session-start` | 无 `session_id` → 忽略；`last_reported == "working"` → **忽略**（判定为子代理创建）；否则上报 `idle` + 会话身份 + 恢复命令，并认领新的 `root_session` | 同左：pane 正在干活时到达的 `SessionStart` 一律忽略 |
+| `session-start` | 无 `session_id` → 忽略；`last_reported == "working"` → **忽略**（真机证实到达的是压缩，不是子代理：子代理发 `SubagentStart`，继承会话不发 `SessionStart`）；否则上报 `idle` + 会话身份 + 恢复命令，并认领新的 `root_session` | 同左：pane 正在干活时到达的 `SessionStart` 一律忽略 |
 | `user-prompt` | 会话 == `root_session` → `working`，**并清掉 `blocked`** | 忽略 |
 | `pre-tool` 且 `tool_name=ask_user` | → `blocked`，`--message` 说明在等决策，记 `blocked_by = 本会话` | → `blocked`，`blocked_by = 子会话` |
 | `post-tool` 且 `tool_name=ask_user` | `details.waiting_for_user == true` → **忽略，保持 `blocked`**；否则（无待答问卷的防御性路径）→ `working`，清 `blocked` | 同左，且只认自己置的位 |

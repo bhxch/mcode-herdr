@@ -1235,7 +1235,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'mcode_herdr.decide'`
   所以 ask_user 的 PostToolUse 只在 waiting_for_user 为假时才允许清障；
   Stop 同样不代表问题已解决：只要 pane 还记着 blocked_by，就不许翻 idle。
   真正的解障信号是用户作答时重新发出的 UserPromptSubmit（user-prompt 分支）。
-- SessionStart 在 pane 处于 working 时到达 → 必定是子代理创建，忽略。
+- SessionStart 在 pane 处于 working 时到达 → 忽略。真机 + 源码核实：此时到达的是**压缩**，不是子代理（子代理发 SubagentStart，且继承会话的 beginTurn 会 early-return 不发 SessionStart）。忽略压缩同时避免「问卷待答时被翻成 idle」。
 - 与上次相同的状态不上报，减少噪声（herdr 侧通知本身也按跃迁去重）。
 """
 from __future__ import annotations

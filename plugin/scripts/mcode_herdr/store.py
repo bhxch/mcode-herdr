@@ -7,8 +7,10 @@ tmp + rename 是另一层独立保证：读者永远看到完整 JSON，不会�
 需要「读最新值 → 决定 → 写回」整体不被穿插的写覆盖时，走 update()。
 
 状态里还记着写它的那台 mcode（pid + 启动指纹）。mcode 被强杀时 Stop 永远不会
-到达，last_reported 停在 working，新会话的 SessionStart 又会被「working ⇒ 必然是
-子代理」吞掉，pane 从此永远卡住。所以读取时先判归属是不是还活着：死了就当没写过。
+到达，last_reported 停在 working，新会话的 SessionStart 又会被「working ⇒ 忽略」
+那条守卫吞掉（到达时的 SessionStart 实际是压缩，不是子代理——子代理发的是
+SubagentStart，继承会话不会发 SessionStart），pane 从此永远卡住。所以读取时先判
+归属是不是还活着：死了就当没写过。
 """
 from __future__ import annotations
 

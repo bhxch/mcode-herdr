@@ -52,12 +52,10 @@ echo "$HERDR_ENV"    # 期望输出 1
 ## 2. 安装
 
 ```bash
-git clone https://github.com/<owner>/mcode-herdr.git mcode-herdr
+git clone https://github.com/bhxch/mcode-herdr.git mcode-herdr
 cd mcode-herdr
 ./install.sh
 ```
-
-（`<owner>` 换成实际仓库归属。）
 
 `install.sh` 做这些事。安装时是唯一有人在场、能低成本发现静默失败的时刻，
 所以每种失败都在这里给出**可操作的**结论，而不是留一个静默的 no-op 给以后：

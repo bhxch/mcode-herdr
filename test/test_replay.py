@@ -307,6 +307,48 @@ class ReplayTest(unittest.TestCase):
             self.env, self.data)
         self.assertEqual(self.states(), ["idle", "working", "blocked", "working"])
 
+    def test_plan_mode_approval_blocks_the_pane_and_survives_its_post_tool(self):
+        """回归：计划模式批准也是「停住等一个人」，pane 必须显示 blocked 并保持住。
+
+        旧 matcher 只挂了 ask_user，于是 ExitPlanMode / request_feature_enable
+        这两条路（计划模式批准、功能开关）在真机上完全不触发钩子：人正对着
+        批准卡片发呆，pane 却一直显示 working，既不通知也不解阻塞。三个工具名
+        是在**已安装的 mcode 0.6.3 bundle** 里逐个确认的（见 fixtures/README.md），
+        权威来源是 bundle 而不是源码树。
+
+        判据不是工具名而是 tool_response.details.waiting_for_user，所以这里
+        喂 ExitPlanMode 的载荷就能走通；后续 Stop 同样不许翻 idle。
+        """
+        root = "mvs_9b41e0c7d5f84a2eb3c6d90f17a48b25"  # 与实测样本同一会话
+        run("session-start", json.dumps({"hook_event_name": "SessionStart", "session_id": root}),
+            self.env, self.data)
+        run("user-prompt", json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": root}),
+            self.env, self.data)
+        run("pre-tool", json.dumps({"hook_event_name": "PreToolUse", "session_id": root,
+                                    "tool_name": "ExitPlanMode",
+                                    "tool_input": {"plan": "## 实施方案"}}),
+            self.env, self.data)
+        self.assertIn("--state blocked", self.calls()[-1])
+        self.assertEqual(self.state_file()["blocked_by"], root)
+        reported_before = len(self.calls())
+
+        # 计划模式同样带 terminate 提前收工：turn 结束，卡片还开在 TUI 上等人点批准
+        run("post-tool", (FIXTURES / "post_tool_plan_mode_waiting.json").read_text(),
+            self.env, self.data)
+        run("stop", json.dumps({"hook_event_name": "Stop", "session_id": root,
+                                "stop_hook_active": False}), self.env, self.data)
+        self.assertEqual(len(self.calls()), reported_before)
+        self.assertEqual(self.state_file()["last_reported"], "blocked")
+
+        # 用户点了批准：新的 UserPromptSubmit 解障，之后正常收尾
+        run("user-prompt", json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": root}),
+            self.env, self.data)
+        self.assertIn("--state working", self.calls()[-1])
+        self.assertIsNone(self.state_file()["blocked_by"])
+        run("stop", json.dumps({"hook_event_name": "Stop", "session_id": root,
+                                "stop_hook_active": False}), self.env, self.data)
+        self.assertEqual(self.states(), ["idle", "working", "blocked", "working", "idle"])
+
     def test_session_end_releases_with_seq(self):
         root = "mvs_root"
         run("session-start", json.dumps({"hook_event_name": "SessionStart", "session_id": root}),

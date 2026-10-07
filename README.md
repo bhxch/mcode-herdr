@@ -333,7 +333,7 @@ plugin/scripts/herdr-report.py ── 读 stdin → 回溯 HERDR_* → Popen(sta
 | `plugin/scripts/mcode_herdr/herdr.py` | 协议常量与标签：`source="mcode-herdr"`、`agent="mcode"` |
 | `plugin/scripts/mcode_herdr/runtime.py` | 把上面这些串成一次完整上报 |
 
-### 4.2 六个钩子，工具钩子只挂 `ask_user`
+### 4.2 六个钩子，工具钩子只挂会阻塞人的三个工具
 
 `plugin/hooks/hooks.json` 注册了 6 个事件，每个都是
 `python3 "${PLUGIN_ROOT}/scripts/herdr-report.py" <event>`，`timeout: 5`：
@@ -342,20 +342,41 @@ plugin/scripts/herdr-report.py ── 读 stdin → 回溯 HERDR_* → Popen(sta
 | --- | --- |
 | `SessionStart` | `session-start` |
 | `UserPromptSubmit` | `user-prompt` |
-| `PreToolUse`（`"matcher": "ask_user"`） | `pre-tool` |
-| `PostToolUse`（`"matcher": "ask_user"`） | `post-tool` |
+| `PreToolUse`（`"matcher": "ask_user\|ExitPlanMode\|request_feature_enable"`） | `pre-tool` |
+| `PostToolUse`（同上） | `post-tool` |
 | `Stop` | `stop` |
 | `SessionEnd` | `session-end` |
 
 事件名是**显式传参**的，脚本不靠载荷里的 `hook_event_name` 做路由，所以载荷字段改名不影响分发。
 
-两个工具钩子带 `"matcher": "ask_user"`，**只为问卷工具触发**。mcode 的
-`matches()`（`plugin-hooks/src/runner.ts`）对 MINIMAX 格式（本插件的格式）的 matcher，
-当 pattern 只含 `[A-Za-z0-9_.:/-]` 时是按 `,`/`|` 切开后做**精确、区分大小写的字符串相等**比较
-（`ask_user` 落在这个分支）；只有含其他字符才退化成正则。所以这里既不是 glob 也不是正则。
+**会停住 turn、把人卡住的工具不止一个。** mcode 0.6.3 里有三个，在**已安装的 bundle**
+（`~/.minimax-code/releases/0.6.3/`，不是源码树）里逐个确认过，返回的都是
+`details.waiting_for_user: true` + `terminate: true`：
+
+| 工具 | 什么时候用 | 它停下来等什么 |
+| --- | --- | --- |
+| `ask_user` | agent 要问用户 | 问卷（`packages/agent-tools/src/desktop/local-ask-user.ts:46`） |
+| `ExitPlanMode` | 计划模式 | 对计划的批准（`packages/agent-extension/src/plan-mode.ts:249-255`） |
+| `request_feature_enable` | 功能开关 | 开不开某个功能（`packages/agent-tools/src/desktop/local-feature-enable.ts:37-46`） |
+
+**漏掉任何一个，失败方式都是静默的**：mcode 根本不触发钩子，人正对着批准卡片发呆，
+pane 却一直显示 `working`，既不通知也等不到。早先只挂了 `ask_user`，计划模式和功能开关
+这两条路一直没被覆盖。
+
+mcode 的 `matches()`（`plugin-hooks/src/runner.ts:1809-1824`）对 MINIMAX 格式（本插件的格式）
+的 matcher：pattern 只含 `[A-Za-z0-9_.:/-]` 时按 `|` 或 `,` 切开，再对每一段做
+**精确、区分大小写的相等**比较；含其他字符才退化成正则。所以上面那个 `|` 串既不是 glob
+也不是正则，写错（例如不小心加了 `*`）会静默只匹配上部分工具。
 
 这条限制是有意为之：不给工具钩子加 matcher 的话，**每一次工具调用都会 fork 一个进程**。
-加上之后，钩子只在真正需要上报 `blocked` 时才触发。
+加上之后，钩子只在真正匹配到的工具上才触发 —— 仍然是「每个**匹配到的**工具调用一个进程」，
+不是「整个会话一个」。
+
+**工具名只存在于这一处。** `decide.py` 刻意不认识它们：到达 `pre-tool` 的事件已经过
+matcher 筛选，而 `PreToolUse` 阶段还没有 `tool_response`，本来就无从判断这次调用会不会
+阻塞人；`post-tool` 则一律按 `tool_response.details.waiting_for_user` 判断。理由见
+[§4.6](#46-状态机只在状态变化时上报)—— 名单一旦抄进状态机，「mcode 新增一个阻塞工具」
+就变成一次必须记得的改代码动作，漏改的后果同样是静默的。
 
 ### 4.3 入口立即返回，上报交给脱离进程组的后台进程
 
@@ -447,9 +468,9 @@ SystemRoot ComSpec USERPROFILE HOMEDRIVE HOMEPATH APPDATA LOCALAPPDATA
 | `session-start` | 上次状态是 `working` | 忽略（判定为子代理创建） |
 | `session-start` | 否则 | 上报 `idle`，认领 `root_session`，附带会话 id 与恢复命令 |
 | `user-prompt` | 会话 == `root_session` | 上报 `working`，**清 `blocked_by`** |
-| `pre-tool` | `tool_name == ask_user` | 上报 `blocked`，记 `blocked_by = 本会话` |
-| `post-tool` | `tool_name == ask_user` 且 `details.waiting_for_user == true` | **忽略，保持 `blocked`** |
-| `post-tool` | `tool_name == ask_user`，没有待答问卷，且 `blocked_by == 本会话` | 上报 `working`，清 `blocked_by`（防御性路径） |
+| `pre-tool` | 有 `session_id` | 上报 `blocked`，记 `blocked_by = 本会话`（工具名由 matcher 负责筛，状态机不看） |
+| `post-tool` | `details.waiting_for_user == true` | **忽略，保持 `blocked`** |
+| `post-tool` | 没有待答问卷，且 `blocked_by == 本会话` | 上报 `working`，清 `blocked_by`（防御性路径） |
 | `stop` | 会话 != `root_session` | 忽略 |
 | `stop` | `blocked_by` 非空 | 忽略（turn 结束 ≠ 问题解决） |
 | `stop` | 否则 | 上报 `idle` |
@@ -500,12 +521,14 @@ herdr 文档也这么要求：
 真退出时 herdr 自己的「agent 进程没了」安全网会在一两秒后收掉它。
 
 **「怎么知道 pane 被卡住了」的真机依据**（mcode 0.6.3，交互式会话，11 个钩子事件全订阅）：
-`ask_user` **不阻塞**这次工具调用，它在 `PreToolUse` 之后约 33ms 就带着
+这类工具**不阻塞**这次工具调用 —— `ask_user` 在 `PreToolUse` 之后约 33ms 就带着
 `terminate=true`、`details.waiting_for_user=true` 返回，随后约 56ms 就来 `Stop` ——
-**turn 结束的时候问卷还开在 TUI 上**。所以：
+**turn 结束的时候问卷还开在 TUI 上**。`ExitPlanMode` / `request_feature_enable` 是同一个
+形状（bundle 里同样是 `waiting_for_user=true` + `terminate=true`）。所以：
 
-- `PostToolUse` 带 `waiting_for_user=true` 是「还在等」的信号，**不是「已答」**，
-  必须保持 `blocked`；
+- 判据是 `PostToolUse` 的 `details.waiting_for_user`，**与工具叫什么无关** —— 这也是
+  `decide.py` 不需要认识工具名的原因（名单只在[§4.2](#42-六个钩子工具钩子只挂会阻塞人的三个工具)的 matcher 里）；
+- `waiting_for_user=true` 是「还在等」的信号，**不是「已答」**，必须保持 `blocked`；
 - `Stop` 只表示这一轮 turn 结束，**不表示问题已解决**，所以 `blocked_by` 非空时
   不翻 `idle`（翻了等于对外宣称「任务完成」）；
 - **真正的解障信号是用户作答**：作答算一次新的用户提示，会以新的 `turn_id` 重新触发
@@ -571,9 +594,9 @@ mcode 给每个子代理**独立的 `session_id`**。所以「`session_id != roo
 - `session-start` 在 pane 处于 `working` 时到达 → **忽略**，当作子代理被创建。
   子代理总是在父 agent 干活期间被创建的，所以这个启发式够用
 
-但 **`blocked` 不能这样过滤**。设计上必须假定子代理**可能**调 `ask_user`，而**此时确实有
+但 **`blocked` 不能这样过滤**。设计上必须假定子代理**可能**调那类会阻塞人的工具，而**此时确实有
 一个真人被卡住了** —— pane 明明停在等人回答上，herdr 却显示 `working` 且永远不通知，
-这是最坏的一种错配。所以子代理的 `ask_user` 照报 `blocked`。
+这是最坏的一种错配。所以子代理的那类提问照报 `blocked`。
 
 代价是必须知道**是谁置的位**：状态文件里记 `blocked_by`，
 `post-tool` 只在 `payload.session_id == blocked_by` 时才可能把 `blocked` 清回 `working`。
@@ -586,9 +609,10 @@ mcode 给每个子代理**独立的 `session_id`**。所以「`session_id != roo
 这个工具**。真机分别派了 `explore` 与 `mavis` 两种子代理去尝试提问，两者独立报告
 调不到、只有顶层 agent 能调（`explore` 报出自己的工具是 bash / glob / grep / read /
 `web_fetch`）。所以上面这条例外分支在当前版本是**前瞻性防御，不是可达路径** ——
-回放测试里那条用例是用构造载荷覆盖的。
+回放测试里那条用例是用构造载荷覆盖的。（这条实测只针对 `ask_user`；另两个阻塞工具
+`ExitPlanMode` / `request_feature_enable` 没有逐个派子代理验证过，所以这里只作防御性保留。）
 
-子代理的 `session_id` 管道仍然保留：mcode 某个版本真把 `ask_user` 暴露给子代理时，
+子代理的 `session_id` 管道仍然保留：mcode 某个版本真把那类工具暴露给子代理时，
 这套机制不用改设计就能接上。**而真机上确实验证过的是**：子代理干活期间，pane 全程停在
 `working`，从未被翻成 `idle`。
 
@@ -721,10 +745,11 @@ cat "${MINIMAX_DATA_DIR:-$HOME/.minimax}"/v2/plugin-data/hooks/mcode-herdr/w4_p3
 
 离线回放，**完全不涉及 herdr 与 mcode**，也不需要网络：喂真实的钩子载荷样本
 （`test/fixtures/`，每个样本的来源见 `test/fixtures/README.md`），用假 herdr 二进制
-逐条记录 argv / socket 请求，再断言调用序列与状态流转。当前 **102 个用例全绿**。
-样本里从未实时抓到的只有子代理工具事件（按 mcode 的字段契约构造），所以子代理路径的
-字段名变更风险未被真实抓包覆盖 —— 而且如第 5 节所述，mcode 0.6.3 的子代理根本调不到
-`ask_user`，这条路径当前连构造动机都有限。
+逐条记录 argv / socket 请求，再断言调用序列与状态流转。当前 **146 个用例全绿**。
+样本里从未实时抓到的只有子代理工具事件（按 mcode 的字段契约构造）和计划模式批准
+那条阻塞链（按**已安装的 0.6.3 bundle** 的实际返回构造）—— 字段名变更风险未被真实
+抓包覆盖；而且如第 5 节所述，mcode 0.6.3 的子代理根本调不到那类工具，子代理路径的
+构造动机有限。
 
 **验证状态说明**：本仓库自带的是离线回放测试。端到端（在真实 herdr pane 里跑 mcode、
 断言 `herdr agent list` 出现 mcode 并正确流转、herdr server 重启后会话恢复）

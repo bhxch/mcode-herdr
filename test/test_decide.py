@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 from mcode_herdr.decide import Action, Decision, decide
 from mcode_herdr.payload import Payload
@@ -6,6 +7,12 @@ from mcode_herdr.store import PaneState
 
 ROOT = "sess-root"
 CHILD = "sess-child"
+
+# 会把一个真人卡住的工具。名单**只**出现在 plugin/hooks/hooks.json 的 matcher 里；
+# 这里照抄一份只为让用例读起来有名字，状态机本身不许认识它们（见 test_hooks_config.py）。
+BLOCKING_TOOLS = ("ask_user", "ExitPlanMode", "request_feature_enable")
+# 三个名字之外的合成工具名：mcode 下个版本新增一个会阻塞人的工具时，它长这样。
+SYNTHETIC_TOOL = "some_future_blocking_prompt"
 
 
 def p(event, session_id=ROOT, tool_name=None, agent_id=None, source=None,
@@ -56,47 +63,74 @@ class DecideTest(unittest.TestCase):
         self.assertEqual(d.state, "working")
         self.assertIsNone(d.blocked_by)
 
-    def test_ask_user_pretool_root_reports_blocked(self):
-        d = decide(Action("pre-tool"), p("PreToolUse", tool_name="ask_user"), PaneState(root_session=ROOT))
-        self.assertEqual(d.state, "blocked")
-        self.assertEqual(d.blocked_by, ROOT)
-        self.assertEqual(d.message, "等待你的决策")  # herdr 通知里给用户看的文案
+    def test_every_blocking_tool_reports_blocked_at_pretool(self):
+        """三个会卡住真人的工具在 PreToolUse 都必须报 blocked。
 
-    def test_ask_user_pretool_from_subagent_also_reports_blocked(self):
+        名单只写在 plugin/hooks/hooks.json 的 matcher 里；状态机不认识任何一个名字，
+        这里是「如果这些工具走了钩子，端到端会不会正确上报」的端点断言。
+        """
+        for tool in BLOCKING_TOOLS + (SYNTHETIC_TOOL,):
+            with self.subTest(tool=tool):
+                d = decide(Action("pre-tool"), p("PreToolUse", tool_name=tool),
+                           PaneState(root_session=ROOT))
+                self.assertEqual(d.state, "blocked")
+                self.assertEqual(d.blocked_by, ROOT)
+                self.assertEqual(d.message, "等待你的决策")  # herdr 通知里给用户看的文案
+
+    def test_blocking_tool_pretool_from_subagent_also_reports_blocked(self):
         # 人确实被问了，子代理提问同样必须报 blocked
         st = PaneState(root_session=ROOT, last_reported="working")
-        d = decide(Action("pre-tool"), p("PreToolUse", session_id=CHILD, tool_name="ask_user", agent_id=CHILD), st)
+        d = decide(Action("pre-tool"), p("PreToolUse", session_id=CHILD,
+                                         tool_name="ask_user", agent_id=CHILD), st)
         self.assertEqual(d.state, "blocked")
         self.assertEqual(d.blocked_by, CHILD)
 
-    def test_ask_user_pretool_without_session_id_ignored(self):
+    def test_blocking_tool_pretool_without_session_id_ignored(self):
         # 没有 session_id 就无从记 blocked_by，这个守卫必须挡住，不许上报 blocked
         self.assertIsNone(decide(Action("pre-tool"), p("PreToolUse", tool_name="ask_user", session_id=None), PaneState(root_session=ROOT)))
 
-    def test_non_ask_user_pretool_ignored(self):
-        self.assertIsNone(decide(Action("pre-tool"), p("PreToolUse", tool_name="bash"), PaneState(root_session=ROOT)))
+    def test_pretool_does_not_inspect_the_tool_name(self):
+        """结构性回归：PreToolUse 阶段状态机不许再按工具名分支。
+
+        PreToolUse 还没有 tool_response，此刻无从知道这次调用到底会不会阻塞人；
+        唯一能挑出「会阻塞的工具」的是 hooks.json 的 matcher。状态机若在这里
+        再认一遍工具名，就得跟着 mcode 的工具清单改代码 —— 那正是本次要根除的
+        那类「名单写在代码里、改一处漏一处」的故障。到达这里的每一个工具都被
+        当成会阻塞人处理；万一 matcher 失配，多报的 blocked 会被同一个工具随后
+        到达的 PostToolUse（没有待答问卷）清掉，代价有界。
+        """
+        for tool in ("bash", "read", "", None, "Ask_User"):
+            with self.subTest(tool=tool):
+                d = decide(Action("pre-tool"), p("PreToolUse", tool_name=tool),
+                           PaneState(root_session=ROOT))
+                self.assertEqual(d.state, "blocked")
 
     def test_posttool_clears_only_own_blocked(self):
-        # waiting_for_user=False 才代表问卷确实被答掉了（作答会让 ask_user 带着
+        # waiting_for_user=False 才代表问卷确实被答掉了（作答会让工具带着
         # 已完成的 tool_response 真正返回，或直接以 UserPromptSubmit 续上新 turn）
         st = PaneState(root_session=ROOT, blocked_by=ROOT, last_reported="blocked")
         d = decide(Action("post-tool"), p("PostToolUse", tool_name="ask_user"), st)
         self.assertEqual(d.state, "working")
         self.assertIsNone(d.blocked_by)
 
-    def test_posttool_while_questionnaire_open_keeps_blocked(self):
-        """P0 回归：ask_user 带 waiting_for_user 立刻返回时，问卷还开着，绝不清障。
+    def test_posttool_keeps_blocked_for_every_blocking_tool_while_waiting(self):
+        """P0 回归：带 waiting_for_user 立刻返回时，问卷还开着，绝不清障。
 
         实测时序 PostToolUse(+33ms) → Stop(+56ms)，turn 在人作答前就结束了。
         原实现在这里翻 working，blocked 只存在 121ms 就被抹掉。
+        原 bug 还有一个更隐蔽的形状：另外两个阻塞工具（计划模式批准、功能开关）
+        根本不在旧 matcher 里，PreToolUse 都不会触发，人被卡住时 pane 一直显示
+        working。matcher 已覆盖三个（见 test_hooks_config.py），这里逐个钉住。
         last_reported 取 "blocked"：无守卫版本会报 "working"，不会被去重吞掉。
         """
-        st = PaneState(root_session=ROOT, blocked_by=ROOT, last_reported="blocked")
-        d = decide(Action("post-tool"),
-                   p("PostToolUse", tool_name="ask_user", waiting_for_user=True), st)
-        self.assertIsNone(d)
+        for tool in BLOCKING_TOOLS + (SYNTHETIC_TOOL,):
+            with self.subTest(tool=tool):
+                st = PaneState(root_session=ROOT, blocked_by=ROOT, last_reported="blocked")
+                d = decide(Action("post-tool"),
+                           p("PostToolUse", tool_name=tool, waiting_for_user=True), st)
+                self.assertIsNone(d)
 
-    def test_posttool_while_questionnaire_open_from_child_also_keeps_blocked(self):
+    def test_posttool_keeps_blocked_for_child_session_while_waiting(self):
         # 子代理提问同一条路：blocked_by 记的是子会话，守卫与等待态都要生效
         st = PaneState(root_session=ROOT, blocked_by=CHILD, last_reported="blocked")
         d = decide(Action("post-tool"),
@@ -117,6 +151,39 @@ class DecideTest(unittest.TestCase):
         # last_reported 取 "idle" 避免无守卫版本的 working 决策被去重吞掉
         st2 = PaneState(root_session=ROOT, last_reported="idle")
         self.assertIsNone(decide(Action("post-tool"), p("PostToolUse", tool_name="ask_user", session_id=None), st2))
+
+    def test_posttool_clears_for_a_matched_tool_without_a_pending_questionnaire(self):
+        """匹配到的工具、但没有待答问卷 → 解除阻塞并回到 working。
+
+        判据是 payload.waiting_for_user（工具自己说的「人还在等吗」），
+        不是工具叫什么。问过计划模式批准后工具正常返回（waiting_for_user 为假）
+        属于这一类。
+        """
+        for tool in BLOCKING_TOOLS + (SYNTHETIC_TOOL,):
+            with self.subTest(tool=tool):
+                st = PaneState(root_session=ROOT, blocked_by=ROOT, last_reported="blocked")
+                d = decide(Action("post-tool"), p("PostToolUse", tool_name=tool), st)
+                self.assertEqual(d.state, "working")
+                self.assertIsNone(d.blocked_by)
+
+    def test_state_machine_does_not_know_the_blocking_tool_names(self):
+        """结构性回归：工具名只允许存在于 hooks.json 的 matcher 里。
+
+        这是本次审计要根除的那一类故障的结构性防线：工具名一旦写进状态机，
+        就得跟着 mcode 的工具清单改代码，改一处漏一处就是一次静默错配
+        （人真被卡住了，pane 却一直显示 working，而且不会有任何报错）。
+        """
+        source = (Path(__file__).resolve().parent.parent
+                  / "plugin" / "scripts" / "mcode_herdr" / "decide.py").read_text()
+        code = "\n".join(line for line in source.splitlines()
+                         if not line.lstrip().startswith("#"))
+        for tool in BLOCKING_TOOLS:
+            for quote in ('"', "'"):
+                with self.subTest(tool=tool, quote=quote):
+                    # 用 assertFalse 而不是 assertNotIn：后者失败时会把整个源码
+                    # 打进测试输出，淹掉真正的失败原因
+                    self.assertFalse(f"{quote}{tool}{quote}" in code,
+                                     f"{tool} 以字面量出现在状态机里，工具名只该在 hooks.json")
 
     def test_stop_while_blocked_does_not_flip_to_idle(self):
         """P0 回归：turn 结束不等于问题解决。

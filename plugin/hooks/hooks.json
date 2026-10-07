@@ -11,13 +11,13 @@
           "timeout": 5 } ] }
     ],
     "PreToolUse": [
-      { "matcher": "ask_user",
+      { "matcher": "ask_user|ExitPlanMode|request_feature_enable",
         "hooks": [ { "type": "command",
           "command": "python3 \"${PLUGIN_ROOT}/scripts/herdr-report.py\" pre-tool",
           "timeout": 5 } ] }
     ],
     "PostToolUse": [
-      { "matcher": "ask_user",
+      { "matcher": "ask_user|ExitPlanMode|request_feature_enable",
         "hooks": [ { "type": "command",
           "command": "python3 \"${PLUGIN_ROOT}/scripts/herdr-report.py\" post-tool",
           "timeout": 5 } ] }

@@ -12,6 +12,7 @@
 | `pre_tool_root.json` | 早期探索时真实抓到的 `PreToolUse` 事件（根会话） | 实测，仅替换了 `transcript_path` |
 | `stop.json` | 早期探索时真实抓到的 `Stop` 事件 | 实测，`last_assistant_message` 的内容为可读性改写 |
 | `post_tool_ask_user_waiting.json` | mcode 0.6.3 真机会话里实时抓到的 `ask_user` `PostToolUse` 事件 | 实测，仅 `tool_input.steps` 的问题正文与部分标识符被改写（见下） |
+| `post_tool_plan_mode_waiting.json` | 照着 mcode 0.6.3 **已安装 bundle**（`~/.minimax-code/releases/0.6.3/`）里 `ExitPlanMode` 的实际返回构造 | 构造（未实时抓包），字段形状取自 bundle，不是源码树 |
 | `pre_tool_subagent.json` | 依据 mcode `plugin-hooks/src/runner.ts` 的 `subagentFields` 字段契约构造 | 构造，子代理工具事件的字段形状来自源码而非抓包 |
 | `post_tool_root.json` | 仿照真实 `PostToolUse` 事件构造，用于验证空值归一 | 构造，`"agent_id": ""` 是防御性取值，非线上格式 |
 
@@ -41,3 +42,16 @@
   均为线上原值，对应测试是 `test_ask_user_post_tool_reports_waiting_for_user`。
   恢复 `blocked` 的真实信号不是这个 `PostToolUse`，而是用户作答时以新 turn
   重新发出的 `UserPromptSubmit`。
+- **会阻塞真人的工具不止 `ask_user`。** 在**已安装的 mcode 0.6.3 bundle**
+  （`~/.minimax-code/releases/0.6.3/lib/node_modules/@minimax-ai/code/chunks/`）里
+  逐个确认过，三个工具返回的 `details.waiting_for_user` 全是 `true`、`terminate` 全是
+  `true`，文案分别是 "is waiting for the local user. Stop this turn until the user
+  replies." / "is awaiting the local user's decision. This turn ends now"：
+  `ask_user`、`ExitPlanMode`（计划模式批准）、`request_feature_enable`（功能开关）。
+  早先只挂了 `ask_user`，另外两个工具弹卡时 pane 一直显示 working —— 静默的错配。
+  `post_tool_plan_mode_waiting.json` 记的就是 `ExitPlanMode` 这一路的形状：
+  `details` 是 `waiting_for_user` + `requestId` + `planPath`（注意这里没有
+  `request_id` / `schema_version` / `step_count`，与 `ask_user` 不同）。
+  这三个名字的权威来源是 bundle，不是源码树 —— 只读 TypeScript 源码不足以断言
+  线上工具名，源码里的名字可能被重写或走别的导出路径。
+

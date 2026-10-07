@@ -2,12 +2,19 @@
 
 设计要点：
 - 子代理有独立 session_id，因此「session_id != root_session」就是可靠判据。
-- blocked 是例外：子代理调 ask_user 时人确实被卡住了，必须上报，并记下 blocked_by，
-  让只有提问者自己的 PostToolUse 能清掉它。
-- 但「清掉它」的前提是问卷真的被答了。实测 ask_user 立刻就带着
+- blocked 是例外：子代理调那类会把人卡住的工具时人确实被卡住了，必须上报，
+  并记下 blocked_by，让只有提问者自己的 PostToolUse 能清掉它。
+- **状态机不认识任何工具名。** 会阻塞真人的工具名单只写在
+  plugin/hooks/hooks.json 的 matcher 里，pre-tool / post-tool 两条分支一律
+  按「到达这里的工具已经过 matcher 筛选」处理。理由有二：PreToolUse 阶段
+  还没有 tool_response，此刻根本无从知道这次调用会不会真的阻塞人；而把名单
+  抄进状态机，就等于让「mcode 新增了一个阻塞工具」变成一次必须记得的改代码
+  动作 —— 漏改的后果是静默的：人真被卡住了，pane 却一直显示 working。
+  blocker 判据统一取 tool_response.details.waiting_for_user。
+- 但「清掉它」的前提是问卷真的被答了。实测那类工具立刻就带着
   tool_response.terminate=true / details.waiting_for_user=true 返回（PreToolUse 后
   约 33ms），随后约 56ms 就来 Stop —— **turn 结束的时候问卷还开着**。
-  所以 ask_user 的 PostToolUse 只在 waiting_for_user 为假时才允许清障；
+  所以 PostToolUse 只在 waiting_for_user 为假时才允许清障；
   Stop 同样不代表问题已解决：只要 pane 还记着 blocked_by，就不许翻 idle。
   真正的解障信号是用户作答时重新发出的 UserPromptSubmit（user-prompt 分支）。
 - SessionStart 在 pane 处于 working 时到达 → 必定是子代理创建，忽略。
@@ -28,8 +35,6 @@ from typing import Optional
 
 from .payload import Payload
 from .store import PaneState
-
-ASK_USER = "ask_user"
 
 # ---- SessionEnd 的 payload.reason：注意「内部取值」不等于「线上取值」 ----
 #
@@ -120,8 +125,11 @@ def decide(action: Action, payload: Payload, state: PaneState) -> Optional[Decis
         return _report("working", state, clear_blocked=True)
 
     if name == "pre-tool":
-        if payload.tool_name != ASK_USER:
-            return None
+        # 刻意不看 tool_name：到达这里的工具已经过 hooks.json 的 matcher 筛选，
+        # 名单就在那一个地方。而且 PreToolUse 阶段还没有 tool_response，此刻
+        # 也无从判断这次调用到底会不会阻塞人 —— 那是 post-tool 的 waiting_for_user
+        # 才回答得了的问题。这里报 blocked 是有界的多报：同一个工具随后到达的
+        # PostToolUse（没有待答问卷）会把它清回 working。
         sid = payload.session_id
         if not sid:
             return None
@@ -133,12 +141,10 @@ def decide(action: Action, payload: Payload, state: PaneState) -> Optional[Decis
         )
 
     if name == "post-tool":
-        if payload.tool_name != ASK_USER:
-            return None
         if not state.blocked_by or payload.session_id != state.blocked_by:
             return None
         if payload.waiting_for_user:
-            # 问卷还开着，人还在等：这个 PostToolUse 只是 ask_user 提前收工，
+            # 问卷还开着，人还在等：这个 PostToolUse 只是工具提前收工，
             # 不是作答。原实现在这里翻 working，实测只让 blocked 存在了 121ms，
             # 紧接着 Stop 又把 pane 标成 done —— herdr agent wait --until blocked
             # 因此基本永远等不到。保持不动，一个字节都不上报。
@@ -149,7 +155,7 @@ def decide(action: Action, payload: Payload, state: PaneState) -> Optional[Decis
         if not root or payload.session_id != root:
             return None  # 子代理的 Stop 绝不能把 pane 翻成 idle
         if state.blocked_by:
-            # turn 结束 ≠ 问题解决：ask_user 是带 terminate 提前收工的，
+            # turn 结束 ≠ 问题解决：那类工具是带 terminate 提前收工的，
             # 此刻人还杵在问卷前面。翻 idle 等于对外宣称「任务完成」。
             # 解障交给 user-prompt：作答会重新触发 UserPromptSubmit。
             return None

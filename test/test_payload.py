@@ -40,6 +40,18 @@ class PayloadTest(unittest.TestCase):
         self.assertEqual(p.tool_name, "ask_user")
         self.assertTrue(p.waiting_for_user)
 
+    def test_plan_mode_post_tool_also_reports_waiting_for_user(self):
+        """计划模式批准同样会停住 turn：details 形状不同，但判据字段是同一个。
+
+        ExitPlanMode 的 details 是 waiting_for_user + requestId + planPath，
+        没有 ask_user 那边的 request_id / schema_version / step_count。
+        解析层只认 waiting_for_user，所以两种形状走同一条判据 —— 这也是
+        decide.py 能不认识任何工具名的前提。
+        """
+        p = fixture("post_tool_plan_mode_waiting.json")
+        self.assertEqual(p.tool_name, "ExitPlanMode")
+        self.assertTrue(p.waiting_for_user)
+
     def test_post_tool_without_details_is_not_waiting(self):
         # post_tool_root.json 的 tool_response 里没有 details，等价于没有等待证据
         self.assertFalse(fixture("post_tool_root.json").waiting_for_user)

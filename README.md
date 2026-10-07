@@ -454,19 +454,31 @@ SystemRoot ComSpec USERPROFILE HOMEDRIVE HOMEPATH APPDATA LOCALAPPDATA
 | `stop` | `blocked_by` 非空 | 忽略（turn 结束 ≠ 问题解决） |
 | `stop` | 否则 | 上报 `idle` |
 | `session-end` | `reason == "logout"` | `release-agent` 交还 pane，并清空该 pane 的状态 |
-| `session-end` | `reason` 是 `clear` / `archive` / `resume_other`（换会话） | 只清会话归属，**不** release；新会话自己的 `SessionStart` 会重新认领 |
-| `session-end` | `reason` 是 `idle_timeout`，或缺失/认不出 | **完全不动** |
+| `session-end` | `reason` 是 `clear` / `resume`（换会话） | 只清会话归属，**不** release；新会话自己的 `SessionStart` 会重新认领 |
+| `session-end` | `reason` 是 `other`（= 归档或空闲超时），或缺失/认不出 | **完全不动** |
 
-**`SessionEnd` 不等于进程退出。** mcode 0.6.3 的 `coordinator.ts` 里它有 5 种
-`payload.reason`，其中只有一种意味着「用户真的退出了」：
+**`SessionEnd` 不等于进程退出，而 `reason` 有两套取值，别混。** mcode 内部是 5 种取值的
+联合类型，但发到钩子之前会先过一遍 `compatibleSessionEndReason`
+（mcode 0.6.3，`packages/agent-modules/plugin-hooks/src/runner.ts:2189-2197`，在
+`runner.ts:1939` 处于序列化前应用）。**钩子读到的是右边一列**：
 
-| `reason` | mcode 还在跑吗 | 触发时机 |
-|---|---|---|
-| `logout` | 否 | 用户退出 |
-| `idle_timeout` | **是** | 空闲 **30 分钟**（`SESSION_IDLE_MS = 30 * 60 * 1_000`）的定时器 |
-| `clear` | **是** | 用户执行 `/clear` |
-| `archive` | **是** | 对话被归档 |
-| `resume_other` | **是** | 同一进程内从会话 A 切到会话 B |
+| 内部取值 | 线上 `payload.reason` | mcode 还在跑吗 | 触发时机 |
+|---|---|---|---|
+| `logout` | `logout` | 否 | 用户退出 |
+| `clear` | `clear` | **是** | 用户执行 `/clear` |
+| `resume_other` | `resume` | **是** | 同一进程内从会话 A 切到会话 B |
+| `archive` | **`other`** | **是** | 对话被归档 |
+| `idle_timeout` | **`other`** | **是** | 空闲 **30 分钟**的定时器 |
+
+三个要点：
+
+- **只有 `logout` 原样上线且意味着「用户真的退出了」**，所以只有它才 release；
+- **空闲超时上线后是 `other`，不是 `idle_timeout`**。这不是读源码推断的：把 mcode 的空闲
+  定时器从 30 分钟缩到 20 秒跑一次真机会话，抓到的真实 `SessionEnd` 就是 `reason='other'`
+  —— 早期实现照抄内部联合类型去匹配 `idle_timeout`，那个分支在线上从未被触发过；
+- **`other` 是 `archive` 与 `idle_timeout` 的合流值，线上分不出二者**。两者对状态机的要求
+  恰好相反（换会话要清归属，空闲超时要完全不动），只能取更保守的那一侧，所以 `other`
+  一律按「不动」处理。
 
 herdr 文档也这么要求：
 
@@ -474,13 +486,15 @@ herdr 文档也这么要求：
 
 若对 `SessionEnd` 无条件 release，**空闲 30 分钟后 agent 就会从面板上消失，而 mcode 还坐在输入框前等着** —— 这是本插件实测踩过的坑。所以只有 `logout` 才 release。
 
-换会话那三种 reason 必须清掉会话归属：若把 `last_reported` 留在 `working`，紧接着的
-`SessionStart` 会撞上「`working` ⇒ 必然是子代理」那条守卫被吞掉，新会话永远建立不起
-`root_session`，后续所有钩子对它都不生效。归属判活救不了这一条 —— 换的是会话，进程还活着。
+换会话那两种线上取值（`clear` / `resume`）必须清掉会话归属：若把 `last_reported` 留在
+`working`，紧接着的 `SessionStart` 会撞上「`working` ⇒ 必然是子代理」那条守卫被吞掉，新会话
+永远建立不起 `root_session`，后续所有钩子对它都不生效。归属判活救不了这一条 —— 换的是会话，
+进程还活着。
 
-`idle_timeout` 反而必须**一个字节都不动**：会话没变、进程没死，只是人走开了。此时清掉
+线上 `other` 反而必须**一个字节都不动**：会话没变、进程没死，只是人走开了。此时清掉
 `root_session`，用户回来敲的第一条 `UserPromptSubmit` 会因为认不出会话被忽略，pane 要
-静默到某个无关的 `SessionStart` 为止。
+静默到某个无关的 `SessionStart` 为止。正因为 `other` 与归档合流、无法分辨，才只能取这个
+更保守的处理 —— 把 `other` 当换会话的 RESET，会以更隐蔽的形式复现同一个故障。
 
 `reason` 缺失或认不出时按「不动」处理：看不懂的信号绝不能当退出处理，而保守的代价有界 ——
 真退出时 herdr 自己的「agent 进程没了」安全网会在一两秒后收掉它。
@@ -552,7 +566,8 @@ mcode 给每个子代理**独立的 `session_id`**。所以「`session_id != roo
   「换会话只清归属」两条路径**都**生效：不带守卫的话，子代理会话以 `clear` 结束时会把
   正在工作的**父**会话的 `root_session` 抹掉，而父会话不会再有 `SessionStart` 来重新认领，
   pane 就永久停在假 busy 且没有自愈路径
-- `session-end` 的 `reason` 不是 `logout` → **不 release**，详见[§4.5](#45-状态每个-pane-一个-json)
+- `session-end` 的线上 `reason` 不是 `logout` → **不 release**，详见[§4.6](#46-状态机只在状态变化时上报)（注意
+  空闲超时上线后是 `other`，不是 `idle_timeout`）
 - `session-start` 在 pane 处于 `working` 时到达 → **忽略**，当作子代理被创建。
   子代理总是在父 agent 干活期间被创建的，所以这个启发式够用
 

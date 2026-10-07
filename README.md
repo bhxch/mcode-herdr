@@ -465,7 +465,7 @@ SystemRoot ComSpec USERPROFILE HOMEDRIVE HOMEPATH APPDATA LOCALAPPDATA
 | 动作 | 条件 | 结果 |
 | --- | --- | --- |
 | `session-start` | 载荷里没有 `session_id` | 忽略 |
-| `session-start` | 上次状态是 `working` | 忽略（判定为子代理创建） |
+| `session-start` | 上次状态是 `working` | 忽略（是上下文压缩，见下） |
 | `session-start` | 否则 | 上报 `idle`，认领 `root_session`，附带会话 id 与恢复命令 |
 | `user-prompt` | 会话 == `root_session` | 上报 `working`，**清 `blocked_by`** |
 | `pre-tool` | 有 `session_id` | 上报 `blocked`，记 `blocked_by = 本会话`（工具名由 matcher 负责筛，状态机不看） |
@@ -524,7 +524,7 @@ herdr `src/platform/mod.rs:409`：有非 shell 进程占据前台时它返回 `N
 自己就能保护住 pane，它一消失 herdr 会在一两秒内清掉）。
 
 换会话那两种线上取值（`clear` / `resume`）必须清掉会话归属：若把 `last_reported` 留在
-`working`，紧接着的 `SessionStart` 会撞上「`working` ⇒ 必然是子代理」那条守卫被吞掉，新会话
+`working`，紧接着的 `SessionStart` 会撞上「`working` ⇒ 压缩」那条守卫被吞掉，新会话
 永远建立不起 `root_session`，后续所有钩子对它都不生效。归属判活救不了这一条 —— 换的是会话，
 进程还活着。
 
@@ -535,6 +535,14 @@ herdr `src/platform/mod.rs:409`：有非 shell 进程占据前台时它返回 `N
 
 `reason` 缺失或认不出时按「不动」处理：看不懂的信号绝不能当退出处理，而保守的代价有界 ——
 进程真退出时 herdr 自己的「agent 进程没了」安全网会在一两秒后收掉它。
+
+**`working` 期间的 `SessionStart` 是压缩，不是子代理。** 早先这里写的理由（「子代理创建时会发
+SessionStart」）是**反的**：子代理发的是 `SubagentStart`，而 `beginTurn` 对继承来的会话直接
+早退、根本不发 `SessionStart`。`SessionStart` 全库只有三个来源：会话内首次激活插件
+（`coordinator.ts:340`）、自动压缩、手动压缩。所以这条守卫真正挡住的是：
+**问卷还开着的时候发生压缩** —— 若放行就会翻成 `idle` 并清掉 `blocked_by`，把一个真被卡住的
+pane 静默降级成「空闲、可以输入了」。同理，§9.2 那条「pane 永久卡死」的修复依赖的也是
+这条守卫，但它跟子代理没关系。
 
 **「怎么知道 pane 被卡住了」的真机依据**（mcode 0.6.3，交互式会话，11 个钩子事件全订阅）：
 这类工具**不阻塞**这次工具调用 —— `ask_user` 在 `PreToolUse` 之后约 33ms 就带着
@@ -607,8 +615,8 @@ mcode 给每个子代理**独立的 `session_id`**。所以「`session_id != roo
   pane 就永久停在假 busy 且没有自愈路径
 - `session-end` 的线上 `reason` 不是 `logout` → **不 release**，详见[§4.6](#46-状态机只在状态变化时上报)（注意
   空闲超时上线后是 `other`，不是 `idle_timeout`）
-- `session-start` 在 pane 处于 `working` 时到达 → **忽略**，当作子代理被创建。
-  子代理总是在父 agent 干活期间被创建的，所以这个启发式够用
+- `session-start` 在 pane 处于 `working` 时到达 → **忽略**。这不是子代理（子代理发的是
+  `SubagentStart`），而是**上下文压缩**；挡住的是「问卷还开着时发生压缩」被误判成收工
 
 但 **`blocked` 不能这样过滤**。设计上必须假定子代理**可能**调那类会阻塞人的工具，而**此时确实有
 一个真人被卡住了** —— pane 明明停在等人回答上，herdr 却显示 `working` 且永远不通知，
@@ -794,7 +802,8 @@ mcode 进程**（`owner_pid` + `owner_start`，见[§4.5](#45-状态每个-pane-
 所以现在**不需要手工清理**：pane 会在下一个 mcode 会话启动时自动恢复。
 
 判据是归属进程的存活，而不是「`working` 这个值本身」。同一 pane 里 mcode 还活着时，
-`working` 仍然会让子代理的 `SessionStart` 被正确吞掉 —— 这条子代理抑制规则不受影响。
+`working` 仍然会让压缩触发的 `SessionStart` 被正确吞掉 —— 这条守卫不受影响
+（它挡的是压缩，不是子代理，见[§4.6](#46-状态机只在状态变化时上报)）。
 
 状态文件里出现 `owner_pid: null`（老版本插件写的、或手工构造的）同样按「归属不明」处理，
 即视为过期。

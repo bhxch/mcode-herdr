@@ -369,7 +369,7 @@ class ReplayTest(unittest.TestCase):
                                        "reason": "logout"}), self.env, self.data)
         run("session-start", json.dumps({"hook_event_name": "SessionStart", "session_id": new}),
             self.env, self.data)
-        # 残留的 last_reported="working" 会让 decide() 把 B 的 SessionStart 当成子代理直接忽略，
+        # 残留的 last_reported="working" 会让 decide() 把 B 的 SessionStart 当成上下文压缩直接忽略，
         # pane 就再也不会被 B 认领 —— 这是能直接被用户看见的故障
         self.assertIn(f"--agent-session-id {new}", self.calls()[-1])
         self.assertIn(f"-- mcode --session {new}", self.calls()[-1])
@@ -442,8 +442,8 @@ class ReplayTest(unittest.TestCase):
         """线上取值 resume（原样 clear 同理）：清会话身份，但 pane 上的 agent 登记留着。
 
         mcode 换会话时前后是同一个活着的进程，所以归属判活救不了「last_reported 停在
-        working」这个陷阱：新会话的 SessionStart 会被当成子代理吞掉，之后它的钩子全被
-        忽略，pane 就再也接不上新会话了。
+        working」这个陷阱：新会话的 SessionStart 会被「working ⇒ 压缩」那条守卫吞掉，
+        之后它的钩子全被忽略，pane 就再也接不上新会话了。
 
         reason 用 resume 而不是内部的 resume_other：compatibleSessionEndReason（runner.ts）
         在序列化前就把 resume_other 改写成 resume，钩子读到的是后者。
@@ -648,8 +648,8 @@ class ReplayTest(unittest.TestCase):
         """P0 回归：写状态的 mcode 已经死了，这份状态就当没写过。
 
         mcode 在一轮进行中被强杀，Stop 永远不会到达，last_reported 停在 working。
-        之后同一 pane 里新起的 mcode，它的 SessionStart 会被「working ⇒ 必然是子代理」
-        吞掉，root_session 永远建立不起来，后续钩子全部失效 —— pane 看起来永久忙碌，
+        之后同一 pane 里新起的 mcode，它的 SessionStart 会被「working ⇒ 压缩」那条
+        守卫吞掉，root_session 永远建立不起来，后续钩子全部失效 —— pane 看起来永久忙碌，
         没有任何东西会自己恢复它（README §9.2 记的就是这个）。归属进程已死就是判据。
         """
         self._seed_state(root_session="mvs_dead", last_reported="working",
@@ -665,7 +665,7 @@ class ReplayTest(unittest.TestCase):
         self.assertIn("--state working", self.calls()[-1])
 
     def test_stuck_working_state_from_a_live_mcode_still_suppresses_subagents(self):
-        """子代理抑制规则不能被这个修复反过来打掉：mcode 还活着，working 就是真的在干活。"""
+        """压缩抑制规则不能被这个修复反过来打掉：mcode 还活着，working 就是真的在干活。"""
         self._seed_state(root_session="mvs_root", last_reported="working",
                          owner_pid=self.owner_pid, owner_start=self.owner_start)
         run("session-start", json.dumps({"hook_event_name": "SessionStart", "session_id": "mvs_child"}),

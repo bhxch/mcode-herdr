@@ -36,7 +36,19 @@ class DecideTest(unittest.TestCase):
         # payload 会把缺失/空白 session_id 归一成 None，这条路径真实可达
         self.assertIsNone(decide(Action("session-start"), p("SessionStart", session_id=None), PaneState()))
 
-    def test_session_start_while_working_is_subagent_and_ignored(self):
+    def test_session_start_while_working_is_a_compaction_and_ignored(self):
+        """回归：working 期间到达的 SessionStart 仍被忽略 —— 它是压缩，不是子代理。
+
+        理由更正过一次：原先写的「子代理创建时会发 SessionStart」是**反的**。
+        子代理发的是 SubagentStart，而 beginTurn 对继承来的会话直接早退、
+        根本不发 SessionStart。SessionStart 全库只有三个来源：会话内首次激活插件
+        （coordinator.ts:340）、自动压缩、手动压缩。所以 working 期间到达的
+        SessionStart 几乎必然是压缩。
+
+        具体挡住的是什么：问卷还开着的时候发生压缩，这条分支若改成上报，
+        就会翻成 idle 并清掉 blocked_by —— 一个真的被卡住的 pane 被静默降级成
+        「空闲、可接受输入」，正是本插件要杜绝的那类错配。
+        """
         st = PaneState(root_session=ROOT, last_reported="working")
         self.assertIsNone(decide(Action("session-start"), p("SessionStart", session_id=CHILD), st))
 
@@ -292,7 +304,7 @@ class DecideTest(unittest.TestCase):
         """线上取值 clear / resume：进程还在，但会话已经换了。
 
         要清的是**会话身份**，不是 pane 上的 agent 登记：留着 last_reported="working" 的话，
-        紧接着到来的新会话 SessionStart 会命中「working ⇒ 必然是子代理」被吞掉，新会话
+        紧接着到来的新会话 SessionStart 会命中「working ⇒ 压缩」那条守卫被吞掉，新会话
         永远认领不了这个 pane，之后它的钩子全部被忽略。归属判活在这里救不了 —— 换会话的
         前后是**同一个**活着的进程。
 

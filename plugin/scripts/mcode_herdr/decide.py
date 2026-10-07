@@ -17,7 +17,9 @@
   所以 PostToolUse 只在 waiting_for_user 为假时才允许清障；
   Stop 同样不代表问题已解决：只要 pane 还记着 blocked_by，就不许翻 idle。
   真正的解障信号是用户作答时重新发出的 UserPromptSubmit（user-prompt 分支）。
-- SessionStart 在 pane 处于 working 时到达 → 必定是子代理创建，忽略。
+- SessionStart 在 pane 处于 working 时到达 → 是**上下文压缩**（自动或手动），
+  忽略。子代理不发 SessionStart（它发 SubagentStart，且 beginTurn 对继承来的
+  会话直接早退），所以这条守卫与子代理无关，见 session-start 分支。
 - SessionEnd 带顶层 payload.reason，且钩子读到的是**改写后**的线上取值，不是 mcode 内部的
   联合类型（映射见下方常量处的注释）。线上 logout 表示**账号登出**：mcode 还活着，
   停在登录提示符，但它干不了活，所以照样 RELEASE（理由见 REASON_LOGOUT 处的注释）。
@@ -127,7 +129,14 @@ def decide(action: Action, payload: Payload, state: PaneState) -> Optional[Decis
         if not sid:
             return None
         if state.last_reported == "working":
-            # 父 agent 正在干活时新建的会话，只可能是子代理。
+            # working 期间到达的 SessionStart 是**上下文压缩**（自动压缩或手动 /compact），
+            # 不是子代理 —— 原先写的理由正好是反的：子代理发的是 SubagentStart，而
+            # beginTurn 对继承来的会话直接早退，根本不发 SessionStart。SessionStart
+            # 全库只有三个来源：会话内首次激活插件（coordinator.ts:340）、自动压缩、手动压缩。
+            #
+            # 具体挡住的是什么：问卷还开着的时候发生压缩，这条分支若放行就会翻成 idle
+            # 并清掉 blocked_by —— 一个真被卡住的 pane 被静默降级成「空闲、可以输入了」。
+            #
             # 前提是「这份 working 一定来自一台活着的 mcode」，这个前提由 store 兜住：
             # 归属进程已经失活的状态在 load 时就被丢成空状态，走不到这里。
             return None

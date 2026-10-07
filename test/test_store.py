@@ -252,7 +252,7 @@ class OwnerLivenessTest(unittest.TestCase):
     """状态由「哪个 mcode 写的」决定还能不能用：写它的进程没了，这份状态就不作数。
 
     mcode 被 kill -9 时 Stop 永远不会到达，last_reported 停在 working；新会话的
-    SessionStart 又会被「working ⇒ 必然是子代理」吞掉，pane 就此永远卡住。
+    SessionStart 又会被「working ⇒ 压缩」那条守卫吞掉，pane 就此永远卡住。
     这里用一份假 /proc 精确控制「归属进程还在不在」。
     """
 
@@ -292,7 +292,7 @@ class OwnerLivenessTest(unittest.TestCase):
         self.assertIsNone(got.owner_pid)
 
     def test_state_from_a_live_owner_is_honoured(self):
-        # 活着的归属必须照常生效：否则每次 load 都在重新认领，子代理抑制规则失效
+        # 活着的归属必须照常生效：否则每次 load 都在重新认领，working ⇒ 压缩那条守卫失效
         self._write_proc(self.LIVE_PID, self.LIVE_START)
         self._seed(owner_pid=str(self.LIVE_PID), owner_start=self.LIVE_START)
         got = self.store.load("w1:p1")
@@ -320,7 +320,7 @@ class OwnerLivenessTest(unittest.TestCase):
     def test_legacy_state_without_owner_is_treated_as_empty(self):
         # 已发布版本落盘的状态没有归属字段。升级后就地改判成过期：证明不了活着
         # 就不能继续当证据 —— 恰恰是这类残留状态最需要被丢掉，否则它们永远等不到
-        # 一次写（所有钩子都被子代理启发式吞掉），也就永远不会被新版本接管。
+        # 一次写（所有钩子都被「working ⇒ 压缩」那条守卫吞掉），也就永远不会被新版本接管。
         self._raw({"root_session": "sess-dead", "blocked_by": None, "last_reported": "working"})
         got = self.store.load("w1:p1")
         self.assertIsNone(got.root_session)
